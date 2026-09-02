@@ -102,12 +102,11 @@ def insert_result(row):
             abordados,
             carros,
             motos,
-            bopm,
             ocorrencias,
             observacao,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["data"].strftime("%Y-%m-%d"),
         row["modalidade"],
@@ -116,7 +115,6 @@ def insert_result(row):
         row["abordados"],
         row["carros"],
         row["motos"],
-        row["bopm"],
         row["ocorrencias"],
         row["observacao"],
         datetime.now().isoformat(timespec="seconds"),
@@ -180,7 +178,6 @@ def import_excel(uploaded_file):
         "ABORDADOS",
         "CARROS",
         "MOTOS",
-        "BOPM",
         "OCORRENCIAS",
     ]
 
@@ -214,7 +211,6 @@ def import_excel(uploaded_file):
         "ABORDADOS",
         "CARROS",
         "MOTOS",
-        "BOPM",
         "OCORRENCIAS"
     ]:
         df[c] = (
@@ -279,7 +275,6 @@ def import_excel(uploaded_file):
             int(r["ABORDADOS"]),
             int(r["CARROS"]),
             int(r["MOTOS"]),
-            int(r["BOPM"]),
             int(r["OCORRENCIAS"]),
             "",
             datetime.now().isoformat(timespec="seconds"),
@@ -540,10 +535,6 @@ def show_dashboard(df):
         f["motos"].sum()
     )
 
-    total_bopm = int(
-        f["bopm"].sum()
-    )
-
     total_ocorrencias = int(
         f["ocorrencias"].sum()
     )
@@ -566,11 +557,6 @@ def show_dashboard(df):
     )
 
     cols[3].metric(
-        "BOPM",
-        f"{total_bopm:,}".replace(",", ".")
-    )
-
-    cols[4].metric(
         "Ocorrências",
         f"{total_ocorrencias:,}".replace(",", ".")
     )
@@ -681,7 +667,6 @@ def show_dashboard(df):
                     "abordados",
                     "carros",
                     "motos",
-                    "bopm",
                     "ocorrencias",
                 ]
             ]
@@ -749,7 +734,6 @@ def show_dashboard(df):
                     "abordados",
                     "carros",
                     "motos",
-                    "bopm",
                     "ocorrencias",
                 ]
             ]
@@ -816,7 +800,6 @@ def show_dashboard(df):
                     "abordados",
                     "carros",
                     "motos",
-                    "bopm",
                     "ocorrencias",
                 ]
             ]
@@ -829,7 +812,6 @@ def show_dashboard(df):
                 "abordados",
                 "carros",
                 "motos",
-                "bopm",
                 "ocorrencias",
             ],
             var_name="indicador",
@@ -842,7 +824,6 @@ def show_dashboard(df):
             "abordados": "Abordados",
             "carros": "Carros",
             "motos": "Motos",
-            "bopm": "BOPM",
             "ocorrencias": "Ocorrências",
         })
 
@@ -888,14 +869,12 @@ def show_dashboard(df):
             "abordados",
             "carros",
             "motos",
-            "bopm",
             "ocorrencias",
         ],
         format_func=lambda x: {
             "abordados": "Abordados",
             "carros": "Carros",
             "motos": "Motos",
-            "bopm": "BOPM",
             "ocorrencias": "Ocorrências",
         }[x],
     )
@@ -991,7 +970,6 @@ def show_dashboard(df):
                 "abordados",
                 "carros",
                 "motos",
-                "bopm",
                 "ocorrencias",
             ]
         ]
@@ -1092,13 +1070,7 @@ def show_lancamento():
             step=1
         )
 
-        bopm = c[3].number_input(
-            "BOPM",
-            min_value=0,
-            step=1
-        )
-
-        ocorrencias = c[4].number_input(
+        ocorrencias = c[3].number_input(
             "Ocorrências",
             min_value=0,
             step=1
@@ -1134,7 +1106,6 @@ def show_lancamento():
             "abordados": int(abordados),
             "carros": int(carros),
             "motos": int(motos),
-            "bopm": int(bopm),
             "ocorrencias": int(ocorrencias),
             "observacao": observacao.strip(),
         })
@@ -1181,7 +1152,6 @@ def show_registros():
             "abordados",
             "carros",
             "motos",
-            "bopm",
             "ocorrencias",
             "observacao",
         ]
