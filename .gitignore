@@ -1,5 +1,12 @@
 __pycache__/
 .venv/
+venv/
+env/
 *.pyc
+.env
+.streamlit/secrets.toml
 .streamlit/
 data/*.db
+*.db
+.pytest_cache/
+.coverage
