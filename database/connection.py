@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import (
     CheckConstraint,
@@ -14,11 +13,13 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    Numeric,
     Table,
     Text,
     UniqueConstraint,
     create_engine,
     event,
+    inspect,
     select,
     text,
 )
@@ -43,6 +44,9 @@ resultados = Table(
     Column("motos", Integer, nullable=False, server_default="0"),
     Column("bopm", Integer, nullable=False, server_default="0"),
     Column("ocorrencias", Integer, nullable=False, server_default="0"),
+    Column("pessoas_presas", Integer, nullable=False, server_default="0"),
+    Column("condenados_capturados", Integer, nullable=False, server_default="0"),
+    Column("veiculos_recuperados", Integer, nullable=False, server_default="0"),
     Column("observacao", Text),
     Column("created_at", Text, nullable=False),
     CheckConstraint("abordados >= 0", name="ck_resultados_abordados"),
@@ -50,6 +54,13 @@ resultados = Table(
     CheckConstraint("motos >= 0", name="ck_resultados_motos"),
     CheckConstraint("bopm >= 0", name="ck_resultados_bopm"),
     CheckConstraint("ocorrencias >= 0", name="ck_resultados_ocorrencias"),
+    CheckConstraint("pessoas_presas >= 0", name="ck_resultados_pessoas_presas"),
+    CheckConstraint(
+        "condenados_capturados >= 0", name="ck_resultados_condenados"
+    ),
+    CheckConstraint(
+        "veiculos_recuperados >= 0", name="ck_resultados_veiculos"
+    ),
     Index("ix_resultados_data", "data"),
     Index("ix_resultados_equipe", "equipe"),
     Index("ix_resultados_pelotao", "pelotao"),
@@ -94,10 +105,95 @@ result_indicator_values = Table(
     Index("ix_result_indicator_values_indicator_id", "indicator_id"),
 )
 
+result_members = Table(
+    "result_members",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "result_id",
+        Integer,
+        ForeignKey("resultados.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("member_name", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+    CheckConstraint("member_name <> ''", name="ck_result_members_name"),
+    UniqueConstraint(
+        "result_id",
+        "member_name",
+        name="uq_result_members_pair",
+    ),
+    Index("ix_result_members_result_id", "result_id"),
+    Index("ix_result_members_name", "member_name"),
+)
+
+occurrence_types = Table(
+    "occurrence_types",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("code", Text, nullable=False),
+    Column("name", Text, nullable=False),
+    Column("kpi_category", Text, nullable=False, server_default=""),
+    Column("active", Integer, nullable=False, server_default="1"),
+    Column("created_at", Text, nullable=False),
+    UniqueConstraint("code", name="uq_occurrence_types_code"),
+)
+
+occurrences = Table(
+    "occurrences",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "result_id",
+        Integer,
+        ForeignKey("resultados.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "occurrence_type_id",
+        Integer,
+        ForeignKey("occurrence_types.id"),
+        nullable=False,
+    ),
+    Column("bopm", Text),
+    Column("bopc", Text),
+    Column("observation", Text),
+    Column("created_at", Text, nullable=False),
+    Index("ix_occurrences_result_id", "result_id"),
+    Index("ix_occurrences_type_id", "occurrence_type_id"),
+)
+
+occurrence_seizures = Table(
+    "occurrence_seizures",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "occurrence_id",
+        Integer,
+        ForeignKey("occurrences.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("category", Text, nullable=False),
+    Column("item", Text, nullable=False),
+    Column("quantity", Numeric(14, 3), nullable=False),
+    Column("unit", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+    CheckConstraint("quantity > 0", name="ck_occurrence_seizures_qty"),
+    CheckConstraint("item <> ''", name="ck_occurrence_seizures_item"),
+    Index("ix_occurrence_seizures_occurrence_id", "occurrence_id"),
+    Index("ix_occurrence_seizures_category", "category"),
+)
+
 DEFAULT_EXTRA_INDICATOR = {
     "name": "Apoios Operacionais",
     "slug": "apoios_operacionais",
 }
+
+RESULTADOS_NEW_COLUMNS = (
+    "pessoas_presas",
+    "condenados_capturados",
+    "veiculos_recuperados",
+)
 
 
 def read_database_url() -> str | None:
@@ -170,8 +266,23 @@ def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
     cursor.close()
 
 
+def _ensure_resultados_columns(engine: Engine) -> None:
+    existing = {col["name"] for col in inspect(engine).get_columns("resultados")}
+    with engine.begin() as conn:
+        for name in RESULTADOS_NEW_COLUMNS:
+            if name in existing:
+                continue
+            conn.execute(
+                text(
+                    f"ALTER TABLE resultados ADD COLUMN {name} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+
+
 def init_schema(engine: Engine) -> None:
     metadata.create_all(engine)
+    _ensure_resultados_columns(engine)
     with engine.begin() as conn:
         conn.execute(
             text("CREATE INDEX IF NOT EXISTS ix_resultados_data ON resultados (data)")
@@ -196,6 +307,30 @@ def init_schema(engine: Engine) -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_result_indicator_values_indicator_id "
                 "ON result_indicator_values (indicator_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_result_members_result_id "
+                "ON result_members (result_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_result_members_name "
+                "ON result_members (member_name)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_occurrences_result_id "
+                "ON occurrences (result_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_occurrence_seizures_occurrence_id "
+                "ON occurrence_seizures (occurrence_id)"
             )
         )
     _seed_default_indicators(engine)

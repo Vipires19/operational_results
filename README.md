@@ -19,7 +19,73 @@ abordados * 2 + carros + motos + ocorrencias * 5
 
 O BOPM permanece visível como indicador individual e **não entra** no índice.
 
-Indicadores adicionais também **não entram** no índice.
+Indicadores adicionais, efetivo, apreensões e tipos de ocorrência também **não entram** no índice.
+
+## Efetivo da equipe
+
+No lançamento, o efetivo é um texto separado por `/`:
+
+```text
+CB PAULINO / SD RUSTIGUELLI / SD BATISTA / SD GARCIA
+```
+
+Não existe cadastro formal de policiais. O nome (incluindo graduação) é a identidade estatística. `CB MORETTO` e `SD MORETTO` são pessoas diferentes.
+
+A produção individual futura representa **participação no resultado da equipe**, não pontuação exclusiva.
+
+Registros antigos não têm efetivo extraído automaticamente da observação.
+
+## Edição de resultados
+
+Em **Registros**, selecione a linha e use **Editar resultado**. A atualização é transacional (resultado + efetivo + indicadores adicionais). `id` e `created_at` não mudam.
+
+Se o resultado tiver ocorrências vinculadas, a exclusão exige confirmação explícita.
+
+## Novos KPIs fixos
+
+Campos permanentes em `resultados`:
+
+- Pessoas presas
+- Condenados capturados
+- Veículos recuperados
+
+Apoios continua sendo o indicador adicional **Apoios Operacionais** (não há coluna duplicada `apoios`).
+
+## Ocorrências
+
+A página **Ocorrências** registra o detalhamento analítico. O campo `Ocorrências` do resultado permanece o consolidado oficial e **não** é recalculado a partir dessa lista.
+
+Cada ocorrência exige:
+
+- um `result_id` (equipe do dia)
+- um tipo do catálogo (`code` + nome)
+- BOPM e BOPC como texto opcional
+
+A data da ocorrência é a data do resultado vinculado.
+
+### Tipos de ocorrência
+
+O usuário cadastra os códigos reais da unidade. Não há tabela fictícia de códigos.
+
+Categoria para KPI (opcional):
+
+- Nenhuma
+- Roubo
+- Furto
+- Roubo de veículo
+- Furto de veículo
+
+Os KPIs de roubo/furto vêm dessa categoria, não do campo `resultados.ocorrencias`.
+
+## Apreensões
+
+Uma ocorrência pode ter 0..N apreensões.
+
+- DROGA: armazenada em **gramas** (kg é convertido). `SUM()` permanece consistente.
+- OBJETO / ARMA / MUNIÇÃO: quantidade inteira em `un`
+- DINHEIRO: `NUMERIC` em BRL
+
+Objetos são consultáveis, mas não são KPI executivo.
 
 ## Indicadores adicionais
 
@@ -161,6 +227,12 @@ O importador procura a linha com:
 `DATA`, `MODALIDADE`, `EQUIPE`, `PELOTÃO`, `ABORDADOS`, `CARROS`, `MOTOS`, `OCORRENCIAS`
 
 A coluna `BOPM` é importada quando existir; caso contrário, grava 0.
+
+Colunas opcionais, se existirem:
+
+`PESSOAS PRESAS`, `CONDENADOS CAPTURADOS`, `VEICULOS RECUPERADOS`, `EFETIVO`
+
+A exportação CSV inclui efetivo (nomes separados por `/`) e os novos KPIs fixos. Ocorrências e apreensões não entram nesse CSV principal.
 
 Observações completas são lidas em **Registros → Ver detalhes**. O dashboard mostra apenas 📝 quando o registro possui observação.
 
