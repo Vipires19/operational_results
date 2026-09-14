@@ -417,9 +417,9 @@ def show_dashboard(engine, df: pd.DataFrame, catalog: list[dict]) -> None:
     extra_keys = chart_keys(catalog, include_index=False)
     members_map = load_members_map(engine)
 
-    show_latest_results(f, members_map, engine)
     show_individual_and_daily(f, members_map, slugs, labels, ranking_keys)
     show_pelotao_and_modalidade(f, slugs, labels, ranking_keys, extra_keys)
+    show_latest_results(f, members_map, engine)
     show_detailed_analyses(f, slugs)
 
 
