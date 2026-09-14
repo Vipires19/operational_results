@@ -10,9 +10,12 @@ from database.repository import (
     APOIOS_SLUG,
     KPI_CATEGORY_LABELS,
     PRODUCTIVITY_COLS,
+    RESERVED_SLUGS,
     SEIZURE_CATEGORIES,
+    assert_unique_columns,
     attach_extra_columns,
     count_occurrences_for_result,
+    dynamic_catalog,
     create_indicator,
     create_occurrence_type,
     delete_indicator,
@@ -185,15 +188,27 @@ def number_column(label: str) -> st.column_config.NumberColumn:
     return st.column_config.NumberColumn(label, format="%d")
 
 
+def unique_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
 def extra_slugs(catalog: list[dict]) -> list[str]:
-    return [item["slug"] for item in catalog]
+    return unique_keep_order([item["slug"] for item in dynamic_catalog(catalog)])
 
 
 def chart_labels(catalog: list[dict]) -> dict[str, str]:
     labels = dict(INDICATOR_LABELS)
     labels.update(PRODUCTIVITY_LABELS)
     for item in catalog:
-        labels[item["slug"]] = item["name"]
+        if item["slug"] not in RESERVED_SLUGS:
+            labels[item["slug"]] = item["name"]
     return labels
 
 
@@ -204,7 +219,7 @@ def chart_keys(catalog: list[dict], include_index: bool = True) -> list[str]:
     keys.extend(METRIC_COLS)
     keys.extend(PRODUCTIVITY_COLS)
     keys.extend(extra_slugs(catalog))
-    return keys
+    return unique_keep_order(keys)
 
 
 def table_config(columns: list[str], catalog: list[dict] | None = None) -> dict:
@@ -252,15 +267,21 @@ def show_kpi_row(f: pd.DataFrame) -> None:
 
 
 def aggregate(df: pd.DataFrame, by: str, slugs: list[str]) -> pd.DataFrame:
-    cols = [c for c in [*METRIC_COLS, *PRODUCTIVITY_COLS, *slugs] if c in df.columns]
+    assert_unique_columns(df, "aggregate:entrada")
+    cols = unique_keep_order(
+        [c for c in [*METRIC_COLS, *PRODUCTIVITY_COLS, *slugs] if c in df.columns]
+    )
     grouped = df.groupby(by, as_index=False)[cols].sum()
+    assert_unique_columns(grouped, "aggregate:saida")
     return add_score(grouped)
 
 
 def ensure_metric_column(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    assert_unique_columns(df, "ensure_metric_column")
     out = df.copy()
     if metric not in out.columns:
         out[metric] = 0
+    assert_unique_columns(out, "ensure_metric_column:saida")
     return out
 
 
@@ -481,7 +502,11 @@ def options_from_data(df: pd.DataFrame, column: str, defaults: list[str]) -> lis
 
 def split_apoios(active_extras: list[dict]) -> tuple[dict | None, list[dict]]:
     apoios = next((item for item in active_extras if item["slug"] == APOIOS_SLUG), None)
-    others = [item for item in active_extras if item["slug"] != APOIOS_SLUG]
+    others = [
+        item
+        for item in active_extras
+        if item["slug"] != APOIOS_SLUG and item["slug"] not in RESERVED_SLUGS
+    ]
     return apoios, others
 
 
@@ -728,8 +753,11 @@ def show_result_details(engine, record: pd.Series, extras: list[dict]) -> None:
     prod[3].metric("Índice", fmt_int(score))
 
     extras_shown = [
-        item for item in extras
-        if int(item["value"]) > 0 and item["slug"] != APOIOS_SLUG
+        item
+        for item in extras
+        if int(item["value"]) > 0
+        and item["slug"] != APOIOS_SLUG
+        and item["slug"] not in RESERVED_SLUGS
     ]
     if extras_shown:
         st.markdown("**Indicadores adicionais**")
@@ -906,6 +934,7 @@ def show_indicadores(engine) -> None:
     if not catalog:
         st.info("Nenhum indicador adicional cadastrado.")
         return
+    dynamic_items = [item for item in catalog if item["slug"] not in RESERVED_SLUGS]
 
     usage = indicator_usage_counts(engine)
     rows = []
@@ -922,13 +951,23 @@ def show_indicadores(engine) -> None:
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     st.subheader("Ativar / desativar")
-    options = {f"{item['name']} ({'ativo' if item['active'] else 'inativo'})": item for item in catalog}
+    if not dynamic_items:
+        st.caption("Não há indicadores dinâmicos para ativar ou desativar.")
+        return
+    options = {
+        f"{item['name']} ({'ativo' if item['active'] else 'inativo'})": item
+        for item in dynamic_items
+    }
     chosen_label = st.selectbox("Indicador", list(options.keys()))
     chosen = options[chosen_label]
     c1, c2, c3 = st.columns(3)
     if c1.button("Ativar"):
-        set_indicator_active(engine, chosen["id"], True)
-        st.rerun()
+        try:
+            set_indicator_active(engine, chosen["id"], True)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
     if c2.button("Desativar"):
         set_indicator_active(engine, chosen["id"], False)
         st.rerun()
@@ -943,7 +982,9 @@ def show_indicadores(engine) -> None:
 
     st.caption(
         "Indicadores inativos saem do lançamento, mas permanecem no histórico, "
-        "nos gráficos e na exportação."
+        "nos gráficos e na exportação. Campos fixos de resultados "
+        "(pessoas presas, condenados capturados e veículos recuperados) "
+        "não podem ser cadastrados ou reativados como indicadores dinâmicos."
     )
 
 
@@ -1348,6 +1389,11 @@ def import_excel(engine, uploaded_file) -> int:
         for v in raw.iloc[header_idx]
     ]
     df.columns = headers
+    if not pd.Index(df.columns).is_unique:
+        duplicated = pd.Index(df.columns)[pd.Index(df.columns).duplicated()].unique().tolist()
+        raise ValueError(
+            f"A planilha possui colunas duplicadas no cabeçalho: {', '.join(duplicated)}."
+        )
 
     required = [
         "DATA",
@@ -1372,11 +1418,19 @@ def import_excel(engine, uploaded_file) -> int:
     }
     efetivo_col = "EFETIVO" if "EFETIVO" in df.columns else None
     catalog = list_indicators(engine)
-    extra_by_header = {item["name"].strip().upper(): item for item in catalog}
-    extra_headers = [col for col in df.columns if col in extra_by_header]
+    extra_by_header = {
+        item["name"].strip().upper(): item
+        for item in catalog
+        if item["slug"] not in RESERVED_SLUGS
+    }
+    extra_headers = [
+        col
+        for col in unique_keep_order(list(df.columns))
+        if col in extra_by_header and col not in optional_fixed
+    ]
     optional_present = [col for col in optional_fixed if col in df.columns]
 
-    cols = (
+    cols = unique_keep_order(
         required
         + (["BOPM"] if has_bopm else [])
         + optional_present
@@ -1491,8 +1545,10 @@ def show_exportacao(df: pd.DataFrame, catalog: list[dict], engine) -> None:
     export["efetivo"] = export["id"].map(
         lambda rid: format_members(members_map.get(int(rid), []))
     )
-    extra_cols = [item["slug"] for item in catalog if item["slug"] in export.columns]
-    export = export[
+    extra_cols = [
+        slug for slug in extra_slugs(catalog) if slug in export.columns
+    ]
+    export_cols = unique_keep_order(
         [
             "data",
             "modalidade",
@@ -1504,7 +1560,8 @@ def show_exportacao(df: pd.DataFrame, catalog: list[dict], engine) -> None:
             *extra_cols,
             "observacao",
         ]
-    ]
+    )
+    export = export[export_cols]
     rename = {
         "data": "DATA",
         "modalidade": "MODALIDADE",
@@ -1542,6 +1599,7 @@ def main() -> None:
         engine = get_cached_engine()
         catalog = list_indicators(engine)
         df = attach_extra_columns(load_data(engine), load_extras_wide(engine), catalog)
+        assert_unique_columns(df, "dataframe principal")
     except Exception:
         logger.exception("Falha ao iniciar conexão com o banco.")
         st.error(

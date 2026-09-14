@@ -45,6 +45,24 @@ RESERVED_SLUGS = {
     "efetivo",
 }
 
+
+def is_dynamic_slug(slug: str) -> bool:
+    return slug not in RESERVED_SLUGS
+
+
+def dynamic_catalog(catalog: list[dict]) -> list[dict]:
+    return [item for item in catalog if is_dynamic_slug(item.get("slug", ""))]
+
+
+def assert_unique_columns(df: pd.DataFrame, origin: str) -> None:
+    if df.columns.is_unique:
+        return
+    duplicated = df.columns[df.columns.duplicated()].unique().tolist()
+    raise ValueError(
+        f"Colunas duplicadas em {origin}: {duplicated}. "
+        "Campos fixos de resultados não podem ser tratados como indicadores dinâmicos."
+    )
+
 KPI_CATEGORY_LABELS = {
     "": "Nenhuma",
     "ROUBO": "Roubo",
@@ -233,6 +251,15 @@ def create_indicator(engine: Engine, name: str) -> dict:
 
 def set_indicator_active(engine: Engine, indicator_id: int, active: bool) -> None:
     with engine.begin() as conn:
+        row = conn.execute(
+            select(operational_indicators.c.slug).where(
+                operational_indicators.c.id == int(indicator_id)
+            )
+        ).first()
+        if row and row.slug in RESERVED_SLUGS and active:
+            raise ValueError(
+                "Este indicador virou campo fixo de resultados e não pode ser reativado."
+            )
         conn.execute(
             operational_indicators.update()
             .where(operational_indicators.c.id == int(indicator_id))
@@ -278,6 +305,7 @@ def load_data(engine: Engine) -> pd.DataFrame:
         for col in RESULT_METRIC_COLS:
             if col not in df.columns:
                 df[col] = pd.Series(dtype="int64")
+        assert_unique_columns(df, "load_data")
         return df
 
     df["data"] = pd.to_datetime(df["data"])
@@ -287,6 +315,7 @@ def load_data(engine: Engine) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     if "observacao" in df.columns:
         df["observacao"] = df["observacao"].fillna("").astype(str)
+    assert_unique_columns(df, "load_data")
     return df
 
 
@@ -319,6 +348,9 @@ def load_extras_wide(engine: Engine) -> pd.DataFrame:
         fill_value=0,
     ).reset_index()
     wide.columns.name = None
+    colliding = [col for col in wide.columns if col in RESERVED_SLUGS]
+    if colliding:
+        wide = wide.drop(columns=colliding)
     return wide
 
 
@@ -328,11 +360,23 @@ def attach_extra_columns(
     catalog: list[dict],
 ) -> pd.DataFrame:
     out = df.copy()
-    slugs = [item["slug"] for item in catalog]
+    assert_unique_columns(out, "attach_extra_columns:entrada")
+    slugs = [item["slug"] for item in dynamic_catalog(catalog)]
 
-    if not extras_wide.empty and "id" in out.columns and not out.empty:
+    extras = extras_wide.copy() if extras_wide is not None else pd.DataFrame()
+    if not extras.empty:
+        colliding = [
+            col
+            for col in extras.columns
+            if col not in {"result_id"}
+            and (col in out.columns or col not in slugs)
+        ]
+        if colliding:
+            extras = extras.drop(columns=colliding, errors="ignore")
+
+    if not extras.empty and "id" in out.columns and not out.empty:
         out = out.merge(
-            extras_wide,
+            extras,
             how="left",
             left_on="id",
             right_on="result_id",
@@ -347,6 +391,8 @@ def attach_extra_columns(
             out[slug] = pd.to_numeric(out[slug], errors="coerce").fillna(0).astype(int)
         else:
             out[slug] = pd.Series(dtype="int64")
+
+    assert_unique_columns(out, "attach_extra_columns")
     return out
 
 
@@ -418,9 +464,18 @@ def _save_extra_values(
 ) -> None:
     if not extras:
         return
+    slug_by_id = {
+        int(row.id): row.slug
+        for row in conn.execute(
+            select(operational_indicators.c.id, operational_indicators.c.slug)
+        )
+    }
     now = _now()
     payloads = []
     for indicator_id, raw_value in extras.items():
+        slug = slug_by_id.get(int(indicator_id), "")
+        if slug in RESERVED_SLUGS:
+            continue
         value = int(raw_value or 0)
         if value < 0:
             raise ValueError("Indicador adicional não pode ser negativo.")

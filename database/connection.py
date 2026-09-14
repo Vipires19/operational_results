@@ -195,6 +195,15 @@ RESULTADOS_NEW_COLUMNS = (
     "veiculos_recuperados",
 )
 
+FIXED_RESULT_SLUGS = (
+    "abordados",
+    "carros",
+    "motos",
+    "bopm",
+    "ocorrencias",
+    *RESULTADOS_NEW_COLUMNS,
+)
+
 
 def read_database_url() -> str | None:
     """Lê DATABASE_URL do ambiente ou de st.secrets. Nunca registra o valor."""
@@ -334,6 +343,7 @@ def init_schema(engine: Engine) -> None:
             )
         )
     _seed_default_indicators(engine)
+    _deactivate_reserved_dynamic_indicators(engine)
 
 
 def _seed_default_indicators(engine: Engine) -> None:
@@ -353,6 +363,16 @@ def _seed_default_indicators(engine: Engine) -> None:
                 active=1,
                 created_at=datetime.now().isoformat(timespec="seconds"),
             )
+        )
+
+
+def _deactivate_reserved_dynamic_indicators(engine: Engine) -> None:
+    """Indicadores extras cujo slug colide com coluna fixa de resultados saem do uso ativo."""
+    with engine.begin() as conn:
+        conn.execute(
+            operational_indicators.update()
+            .where(operational_indicators.c.slug.in_(FIXED_RESULT_SLUGS))
+            .values(active=0)
         )
 
 
