@@ -4,12 +4,15 @@ from database.repository import (
     create_indicator,
     delete_indicator,
     delete_result,
+    get_member_production,
     insert_many,
     insert_result,
     list_active_indicators,
     list_indicators,
     load_data,
     load_extras_wide,
+    load_occurrences_map,
+    load_seizure_summary_by_result,
     set_indicator_active,
 )
 
@@ -27,4 +30,7 @@ __all__ = [
     "create_indicator",
     "set_indicator_active",
     "delete_indicator",
+    "get_member_production",
+    "load_occurrences_map",
+    "load_seizure_summary_by_result",
 ]
