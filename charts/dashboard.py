@@ -6,19 +6,25 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-BAR_COLOR = "#1e4a6e"
-AREA_COLOR = "#2563eb"
-MA_COLOR = "#c2410c"
+BAR_COLOR = "#3b82f6"
+AREA_COLOR = "#60a5fa"
+MA_COLOR = "#fb923c"
+
+HOVERLABEL = dict(
+    bgcolor="#1e293b",
+    bordercolor="#64748b",
+    font=dict(size=12, color="#f8fafc"),
+)
 
 
 def apply_layout(fig: go.Figure, height: int = 390) -> go.Figure:
     fig.update_layout(
         height=height,
-        margin=dict(l=10, r=28, t=16, b=10),
+        margin=dict(l=10, r=36, t=16, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(size=12, color="#0f172a"),
-        hoverlabel=dict(bgcolor="white", font_size=12),
+        font=dict(size=12),
+        hoverlabel=HOVERLABEL,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -45,7 +51,14 @@ def apply_layout(fig: go.Figure, height: int = 390) -> go.Figure:
     return fig
 
 
-def horizontal_bar(df: pd.DataFrame, x_col: str, y_col: str) -> go.Figure:
+def horizontal_bar(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    *,
+    value_label: str = "Valor",
+    services_col: str | None = None,
+) -> go.Figure:
     ordered = df.sort_values(x_col, ascending=True)
     height = max(280, min(52 * max(len(ordered), 1) + 90, 900))
 
@@ -57,12 +70,28 @@ def horizontal_bar(df: pd.DataFrame, x_col: str, y_col: str) -> go.Figure:
         text=x_col,
         color_discrete_sequence=[BAR_COLOR],
     )
+    if services_col and services_col in ordered.columns:
+        fig.update_traces(
+            customdata=ordered[[services_col]].to_numpy(),
+            hovertemplate=(
+                f"<b>%{{y}}</b><br>"
+                f"{value_label}: %{{x:,.0f}}<br>"
+                "Serviços: %{customdata[0]:,.0f}"
+                "<extra></extra>"
+            ),
+        )
+    else:
+        fig.update_traces(
+            hovertemplate=(
+                f"<b>%{{y}}</b><br>{value_label}: %{{x:,.0f}}<extra></extra>"
+            ),
+        )
     fig.update_traces(
         texttemplate="%{text:,.0f}",
         textposition="outside",
         cliponaxis=False,
-        hovertemplate="<b>%{y}</b><br>Valor: %{x:,.0f}<extra></extra>",
         marker_line_width=0,
+        hoverlabel=HOVERLABEL,
     )
     fig.update_layout(showlegend=False)
     return apply_layout(fig, height)
@@ -91,6 +120,7 @@ def area_daily(daily: pd.DataFrame, show_ma: bool = False) -> go.Figure:
             "Ocorrências: %{customdata[4]:,.0f}"
             "<extra></extra>"
         ),
+        hoverlabel=HOVERLABEL,
     )
     fig.update_xaxes(tickformat="%d/%m")
     fig.update_layout(hovermode="x unified")
@@ -102,9 +132,8 @@ def area_daily(daily: pd.DataFrame, show_ma: bool = False) -> go.Figure:
             name="Média 7 dias",
             mode="lines",
             line=dict(color=MA_COLOR, width=2, dash="dash"),
-            hovertemplate=(
-                "<b>%{x|%d/%m/%Y}</b><br>Média 7 dias: %{y:,.1f}<extra></extra>"
-            ),
+            hovertemplate="Média 7 dias: %{y:,.1f}<extra></extra>",
+            hoverlabel=HOVERLABEL,
         )
 
     return apply_layout(fig, 400)

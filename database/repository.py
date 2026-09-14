@@ -63,6 +63,17 @@ def assert_unique_columns(df: pd.DataFrame, origin: str) -> None:
         "Campos fixos de resultados não podem ser tratados como indicadores dinâmicos."
     )
 
+
+def _unique_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    ordered = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
 KPI_CATEGORY_LABELS = {
     "": "Nenhuma",
     "ROUBO": "Roubo",
@@ -918,55 +929,152 @@ def list_linked_occurrences(engine: Engine, result_id: int) -> list[dict]:
     ]
 
 
+def get_member_production(
+    df: pd.DataFrame,
+    members_map: dict[int, list[str]],
+    extra_slugs: list[str] | None = None,
+) -> pd.DataFrame:
+    """Produção por participação: cada policial herda o resultado em que esteve."""
+    metric_cols = _unique_keep_order(
+        [
+            *METRIC_COLS,
+            *PRODUCTIVITY_COLS,
+            APOIOS_SLUG,
+            *(extra_slugs or []),
+            "indice_producao",
+        ]
+    )
+    empty = pd.DataFrame(columns=["member_name", "services", *metric_cols])
+
+    if df is None or df.empty or not members_map:
+        return empty
+
+    assert_unique_columns(df, "get_member_production:entrada")
+    work = df.copy()
+    for col in metric_cols:
+        if col == "indice_producao":
+            continue
+        if col not in work.columns:
+            work[col] = 0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0).astype(int)
+
+    work["indice_producao"] = (
+        work["abordados"] * 2
+        + work["carros"]
+        + work["motos"]
+        + work["ocorrencias"] * 5
+    )
+
+    members_rows = [
+        {"id": int(result_id), "member_name": name}
+        for result_id, names in members_map.items()
+        for name in names
+        if name
+    ]
+    if not members_rows:
+        return empty
+
+    merged = work.merge(pd.DataFrame(members_rows), on="id", how="inner")
+    if merged.empty:
+        return empty
+
+    grouped = merged.groupby("member_name", as_index=False).agg(
+        services=("id", "count"),
+        **{col: (col, "sum") for col in metric_cols},
+    )
+    grouped["services"] = grouped["services"].astype(int)
+    for col in metric_cols:
+        grouped[col] = pd.to_numeric(grouped[col], errors="coerce").fillna(0).astype(int)
+    assert_unique_columns(grouped, "get_member_production:saida")
+    return grouped
+
+
 def aggregate_member_production(
     engine: Engine,
     start: str | None = None,
     end: str | None = None,
 ) -> pd.DataFrame:
+    catalog = list_indicators(engine)
     df = attach_extra_columns(
-        load_data(engine), load_extras_wide(engine), list_indicators(engine)
+        load_data(engine), load_extras_wide(engine), catalog
     )
     if df.empty:
-        return df
+        return get_member_production(df, {}, extra_slugs=[APOIOS_SLUG])
     if start:
         df = df[df["data"].dt.strftime("%Y-%m-%d") >= start]
     if end:
         df = df[df["data"].dt.strftime("%Y-%m-%d") <= end]
-    members_map = load_members_map(engine)
-    rows = []
-    for _, result in df.iterrows():
-        names = members_map.get(int(result["id"]), [])
-        score = (
-            int(result["abordados"]) * 2
-            + int(result["carros"])
-            + int(result["motos"])
-            + int(result["ocorrencias"]) * 5
+    slugs = [item["slug"] for item in dynamic_catalog(catalog)]
+    return get_member_production(df, load_members_map(engine), slugs)
+
+
+def load_occurrences_map(
+    engine: Engine, result_ids: list[int]
+) -> dict[int, list[dict]]:
+    ids = [int(rid) for rid in result_ids]
+    if not ids:
+        return {}
+    query = (
+        select(
+            occurrences.c.result_id,
+            occurrences.c.id,
+            occurrence_types.c.code,
+            occurrence_types.c.name,
         )
-        for name in names:
-            rows.append(
+        .select_from(
+            occurrences.join(
+                occurrence_types,
+                occurrences.c.occurrence_type_id == occurrence_types.c.id,
+            )
+        )
+        .where(occurrences.c.result_id.in_(ids))
+        .order_by(occurrences.c.id)
+    )
+    mapping: dict[int, list[dict]] = {}
+    with engine.connect() as conn:
+        for row in conn.execute(query):
+            mapping.setdefault(int(row.result_id), []).append(
                 {
-                    "member_name": name,
-                    "services": 1,
-                    "abordados": int(result["abordados"]),
-                    "carros": int(result["carros"]),
-                    "motos": int(result["motos"]),
-                    "bopm": int(result["bopm"]),
-                    "ocorrencias": int(result["ocorrencias"]),
-                    "apoios": int(result.get(APOIOS_SLUG, 0) or 0),
-                    "pessoas_presas": int(result.get("pessoas_presas", 0) or 0),
-                    "condenados_capturados": int(
-                        result.get("condenados_capturados", 0) or 0
-                    ),
-                    "veiculos_recuperados": int(
-                        result.get("veiculos_recuperados", 0) or 0
-                    ),
-                    "indice_producao": score,
+                    "id": int(row.id),
+                    "code": row.code,
+                    "name": row.name,
                 }
             )
-    if not rows:
-        return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    return out.groupby("member_name", as_index=False).sum(numeric_only=True)
+    return mapping
+
+
+def load_seizure_summary_by_result(
+    engine: Engine, result_ids: list[int]
+) -> dict[int, dict[str, Decimal]]:
+    ids = [int(rid) for rid in result_ids]
+    if not ids:
+        return {}
+    categories = ("DROGA", "ARMA", "MUNICAO")
+    query = (
+        select(
+            occurrences.c.result_id,
+            occurrence_seizures.c.category,
+            func.sum(occurrence_seizures.c.quantity).label("total"),
+        )
+        .select_from(
+            occurrence_seizures.join(
+                occurrences,
+                occurrence_seizures.c.occurrence_id == occurrences.c.id,
+            )
+        )
+        .where(
+            occurrences.c.result_id.in_(ids),
+            occurrence_seizures.c.category.in_(categories),
+        )
+        .group_by(occurrences.c.result_id, occurrence_seizures.c.category)
+    )
+    mapping: dict[int, dict[str, Decimal]] = {}
+    with engine.connect() as conn:
+        for row in conn.execute(query):
+            mapping.setdefault(int(row.result_id), {})[str(row.category)] = Decimal(
+                str(row.total or 0)
+            )
+    return mapping
 
 
 def occurrence_kpis(

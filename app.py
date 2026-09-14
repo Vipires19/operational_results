@@ -23,6 +23,7 @@ from database.repository import (
     delete_occurrence_type,
     delete_result,
     format_members,
+    get_member_production,
     get_occurrence_seizures,
     get_result_extra_values,
     get_result_members,
@@ -39,6 +40,8 @@ from database.repository import (
     load_extras_wide,
     load_members_map,
     load_occurrences,
+    load_occurrences_map,
+    load_seizure_summary_by_result,
     occurrence_type_usage_counts,
     set_indicator_active,
     set_occurrence_type_active,
@@ -103,20 +106,22 @@ CSS = """
         max-width: 1400px;
     }
     [data-testid="stMetric"] {
-        background: #f8fafc;
-        border: 1px solid #e2e8f0;
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(148, 163, 184, 0.35);
         border-radius: 10px;
         padding: 0.7rem 0.9rem;
     }
     [data-testid="stMetricValue"] {
         font-size: 1.65rem;
-        color: #0f172a;
+        color: var(--text-color);
     }
     [data-testid="stMetricLabel"] {
-        color: #475569;
+        color: var(--text-color);
+        opacity: 0.78;
     }
     .small-muted {
-        color: #64748b;
+        color: var(--text-color);
+        opacity: 0.7;
         font-size: .9rem;
     }
 </style>
@@ -132,6 +137,39 @@ def get_cached_engine():
 
 def fmt_int(value) -> str:
     return f"{int(value):,}".replace(",", ".")
+
+
+def fmt_date_long(value) -> str:
+    day = value.date() if hasattr(value, "date") else value
+    meses = (
+        "janeiro",
+        "fevereiro",
+        "março",
+        "abril",
+        "maio",
+        "junho",
+        "julho",
+        "agosto",
+        "setembro",
+        "outubro",
+        "novembro",
+        "dezembro",
+    )
+    return f"{day.day} de {meses[day.month - 1]} de {day.year}"
+
+
+def fmt_kg_from_grams(grams) -> str:
+    kg = float(grams) / 1000
+    return f"{kg:.3f}".replace(".", ",") + " kg"
+
+
+def iter_chunks(items: list, size: int = 3):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def metric_lines(pairs: list[tuple[str, str]]) -> str:
+    return "  \n".join(f"{label}: **{value}**" for label, value in pairs)
 
 
 def production_score(df: pd.DataFrame) -> pd.Series:
@@ -285,11 +323,11 @@ def ensure_metric_column(df: pd.DataFrame, metric: str) -> pd.DataFrame:
     return out
 
 
-def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
+def show_dashboard(engine, df: pd.DataFrame, catalog: list[dict]) -> None:
     st.title("📊 Resultado Operacional")
     st.caption(
-        "Controle e análise de produção operacional "
-        "por dia, equipe, pelotão e modalidade."
+        "Leitura executiva da produção operacional "
+        "por efetivo, pelotão, modalidade e último serviço."
     )
 
     if df.empty:
@@ -368,7 +406,6 @@ def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
 
     f = filtered_data(df, start, end, modalidades, pelotoes, equipes)
     show_kpi_row(f)
-    st.divider()
 
     if f.empty:
         st.warning("Nenhum resultado encontrado para os filtros selecionados.")
@@ -378,12 +415,131 @@ def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
     labels = chart_labels(catalog)
     ranking_keys = chart_keys(catalog, include_index=True)
     extra_keys = chart_keys(catalog, include_index=False)
+    members_map = load_members_map(engine)
 
+    show_latest_results(f, members_map, engine)
+    show_individual_and_daily(f, members_map, slugs, labels, ranking_keys)
+    show_pelotao_and_modalidade(f, slugs, labels, ranking_keys, extra_keys)
+    show_detailed_analyses(f, slugs)
+
+
+def show_latest_results(f: pd.DataFrame, members_map: dict, engine) -> None:
+    latest_ts = f["data"].max()
+    latest = f[f["data"] == latest_ts].sort_values(["equipe", "id"])
+    records = latest.to_dict("records")
+    result_ids = [int(row["id"]) for row in records]
+    occ_map = load_occurrences_map(engine, result_ids)
+    seizure_map = load_seizure_summary_by_result(engine, result_ids)
+
+    st.subheader("🚔 Último Resultado Operacional")
+    st.caption(
+        f"{fmt_date_long(latest_ts)} · último dia com dados dentro dos filtros"
+    )
+
+    for chunk in iter_chunks(records, 3):
+        cols = st.columns(len(chunk))
+        for col, record in zip(cols, chunk):
+            with col:
+                render_latest_result_card(
+                    record,
+                    members_map.get(int(record["id"]), []),
+                    occ_map.get(int(record["id"]), []),
+                    seizure_map.get(int(record["id"]), {}),
+                )
+
+
+def render_latest_result_card(
+    record: dict,
+    members: list[str],
+    occurrences: list[dict],
+    seizures: dict,
+) -> None:
+    score = int(
+        record["abordados"] * 2
+        + record["carros"]
+        + record["motos"]
+        + record["ocorrencias"] * 5
+    )
+    apoios = int(record.get(APOIOS_SLUG, 0) or 0)
+    bopm = int(record.get("bopm", 0) or 0)
+
+    with st.container(border=True):
+        st.markdown(f"**{record['equipe']}**")
+        st.caption(f"{record['pelotao']} • {record['modalidade']}")
+        st.caption(f"Índice: {fmt_int(score)}")
+
+        if members:
+            st.markdown("  \n".join(str(name) for name in members))
+        else:
+            st.caption("Efetivo não informado")
+
+        left, right = st.columns(2)
+        left.markdown("**Resultado operacional**")
+        left.markdown(
+            metric_lines(
+                [
+                    ("Abordados", fmt_int(record["abordados"])),
+                    ("Carros", fmt_int(record["carros"])),
+                    ("Motos", fmt_int(record["motos"])),
+                    ("Ocorrências", fmt_int(record["ocorrencias"])),
+                    ("Apoios", fmt_int(apoios)),
+                ]
+            )
+        )
+        if bopm:
+            left.caption(f"BOPM: {fmt_int(bopm)}")
+
+        right.markdown("**Produtividade**")
+        right.markdown(
+            metric_lines(
+                [
+                    ("Pessoas presas", fmt_int(record.get("pessoas_presas", 0))),
+                    (
+                        "Condenados capturados",
+                        fmt_int(record.get("condenados_capturados", 0)),
+                    ),
+                    (
+                        "Veículos recuperados",
+                        fmt_int(record.get("veiculos_recuperados", 0)),
+                    ),
+                ]
+            )
+        )
+
+        if occurrences:
+            st.markdown("**Ocorrências**")
+            st.markdown(
+                "  \n".join(
+                    f"{item['code']} — {item['name']}" for item in occurrences
+                )
+            )
+
+        seizure_lines = []
+        droga = seizures.get("DROGA")
+        if droga:
+            seizure_lines.append(f"Drogas: {fmt_kg_from_grams(droga)}")
+        arma = seizures.get("ARMA")
+        if arma:
+            seizure_lines.append(f"Armas: {fmt_int(arma)}")
+        municao = seizures.get("MUNICAO")
+        if municao:
+            seizure_lines.append(f"Munições: {fmt_int(municao)}")
+        if seizure_lines:
+            st.markdown("**Apreensões**")
+            st.markdown("  \n".join(seizure_lines))
+
+
+def show_individual_and_daily(
+    f: pd.DataFrame,
+    members_map: dict,
+    slugs: list[str],
+    labels: dict[str, str],
+    ranking_keys: list[str],
+) -> None:
     left, right = st.columns([1.15, 1])
-
     with left:
-        title_col, metric_col = st.columns([1.4, 1])
-        title_col.subheader("🏆 Ranking de equipes")
+        title_col, metric_col, top_col = st.columns([1.35, 1, 0.7])
+        title_col.subheader("🏆 Produção individual")
         ranking_metric = metric_col.selectbox(
             "Indicador",
             ranking_keys,
@@ -391,8 +547,38 @@ def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
             key="ranking_metric",
             label_visibility="collapsed",
         )
-        ranking = ensure_metric_column(aggregate(f, "equipe", slugs), ranking_metric)
-        plot_chart(horizontal_bar(ranking, ranking_metric, "equipe"))
+        top_label = top_col.selectbox(
+            "Quantidade",
+            ["Top 5", "Top 10", "Top 15", "Todos"],
+            index=1,
+            key="ranking_top",
+            label_visibility="collapsed",
+        )
+        production = get_member_production(f, members_map, slugs)
+        if production.empty:
+            st.info(
+                "Ainda não há efetivo estruturado suficiente "
+                "para gerar o ranking individual."
+            )
+        else:
+            ranked = ensure_metric_column(production, ranking_metric)
+            ranked = ranked.sort_values(ranking_metric, ascending=False)
+            limits = {"Top 5": 5, "Top 10": 10, "Top 15": 15, "Todos": None}
+            limit = limits[top_label]
+            if limit:
+                ranked = ranked.head(limit)
+            plot_chart(
+                horizontal_bar(
+                    ranked,
+                    ranking_metric,
+                    "member_name",
+                    value_label=labels.get(ranking_metric, ranking_metric),
+                    services_col="services",
+                )
+            )
+            st.caption(
+                "Cada policial recebe o resultado dos serviços em que participou."
+            )
 
     with right:
         st.subheader("📈 Evolução diária")
@@ -409,8 +595,15 @@ def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
         if show_ma:
             st.caption("Linha tracejada: média móvel de 7 dias.")
 
-    left, right = st.columns([1.15, 1])
 
+def show_pelotao_and_modalidade(
+    f: pd.DataFrame,
+    slugs: list[str],
+    labels: dict[str, str],
+    ranking_keys: list[str],
+    extra_keys: list[str],
+) -> None:
+    left, right = st.columns([1.15, 1])
     with left:
         title_col, metric_col = st.columns([1.4, 1])
         title_col.subheader("🎖️ Produção por pelotão")
@@ -422,11 +615,18 @@ def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
             label_visibility="collapsed",
         )
         by_pelotao = ensure_metric_column(aggregate(f, "pelotao", slugs), pelotao_metric)
-        plot_chart(horizontal_bar(by_pelotao, pelotao_metric, "pelotao"))
+        plot_chart(
+            horizontal_bar(
+                by_pelotao,
+                pelotao_metric,
+                "pelotao",
+                value_label=labels.get(pelotao_metric, pelotao_metric),
+            )
+        )
 
     with right:
         title_col, metric_col = st.columns([1.4, 1])
-        title_col.subheader("🚔 Resultados por modalidade")
+        title_col.subheader("🚓 Resultados por modalidade")
         modalidade_metric = metric_col.selectbox(
             "Indicador por modalidade",
             extra_keys,
@@ -435,62 +635,81 @@ def show_dashboard(df: pd.DataFrame, catalog: list[dict]) -> None:
             label_visibility="collapsed",
         )
         by_mod = ensure_metric_column(aggregate(f, "modalidade", slugs), modalidade_metric)
-        plot_chart(horizontal_bar(by_mod, modalidade_metric, "modalidade"))
+        plot_chart(
+            horizontal_bar(
+                by_mod,
+                modalidade_metric,
+                "modalidade",
+                value_label=labels.get(modalidade_metric, modalidade_metric),
+            )
+        )
 
-    st.subheader("📋 Ranking detalhado")
-    ranking_display = ranking.sort_values("indice_producao", ascending=False).copy()
-    ranking_display.insert(0, "Posição", range(1, len(ranking_display) + 1))
-    ranking_cols = [
-        "Posição",
-        "equipe",
-        "abordados",
-        "carros",
-        "motos",
-        "bopm",
-        "ocorrencias",
-        "indice_producao",
-    ]
-    st.dataframe(
-        ranking_display[ranking_cols],
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Posição": number_column("Posição"),
-            **table_config(ranking_cols[1:]),
-        },
-    )
 
-    st.subheader("📅 Resultado por dia")
-    daily_display = daily.sort_values("data", ascending=False).copy()
-    daily_display["data"] = daily_display["data"].dt.strftime("%d/%m/%Y")
-    daily_cols = ["data", *METRIC_COLS, "indice_producao"]
-    st.dataframe(
-        daily_display[daily_cols],
-        width="stretch",
-        hide_index=True,
-        column_config=table_config(daily_cols),
-    )
+def show_detailed_analyses(f: pd.DataFrame, slugs: list[str]) -> None:
+    with st.expander("📋 Análises detalhadas", expanded=False):
+        by_equipe = aggregate(f, "equipe", slugs)
+        ranking_display = by_equipe.sort_values(
+            "indice_producao", ascending=False
+        ).copy()
+        ranking_display.insert(0, "Posição", range(1, len(ranking_display) + 1))
+        ranking_cols = [
+            "Posição",
+            "equipe",
+            "abordados",
+            "carros",
+            "motos",
+            "bopm",
+            "ocorrencias",
+            "indice_producao",
+        ]
+        st.markdown("**Produção por equipe**")
+        st.dataframe(
+            ranking_display[ranking_cols],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Posição": number_column("Posição"),
+                **table_config(ranking_cols[1:]),
+            },
+        )
 
-    st.subheader("📑 Tabela operacional detalhada")
-    detail = add_score(f).sort_values(["data", "id"], ascending=[False, False])
-    detail_view = detail.copy()
-    detail_view["data"] = detail_view["data"].dt.strftime("%d/%m/%Y")
-    detail_view["obs"] = obs_flag(detail_view.get("observacao", pd.Series(dtype=str)))
-    detail_cols = [
-        "data",
-        "modalidade",
-        "equipe",
-        "pelotao",
-        *METRIC_COLS,
-        "indice_producao",
-        "obs",
-    ]
-    st.dataframe(
-        detail_view[detail_cols],
-        width="stretch",
-        hide_index=True,
-        column_config=table_config(detail_cols),
-    )
+        daily = (
+            f.groupby("data", as_index=False)[METRIC_COLS]
+            .sum()
+            .sort_values("data", ascending=False)
+        )
+        daily = add_score(daily)
+        daily_display = daily.copy()
+        daily_display["data"] = daily_display["data"].dt.strftime("%d/%m/%Y")
+        daily_cols = ["data", *METRIC_COLS, "indice_producao"]
+        st.markdown("**Resultado por dia**")
+        st.dataframe(
+            daily_display[daily_cols],
+            width="stretch",
+            hide_index=True,
+            column_config=table_config(daily_cols),
+        )
+
+        detail = add_score(f).sort_values(["data", "id"], ascending=[False, False])
+        detail_view = detail.copy()
+        detail_view["data"] = detail_view["data"].dt.strftime("%d/%m/%Y")
+        detail_view["obs"] = obs_flag(detail_view.get("observacao", pd.Series(dtype=str)))
+        detail_cols = [
+            "data",
+            "modalidade",
+            "equipe",
+            "pelotao",
+            *METRIC_COLS,
+            "indice_producao",
+            "obs",
+        ]
+        st.markdown("**Tabela operacional**")
+        st.dataframe(
+            detail_view[detail_cols],
+            width="stretch",
+            hide_index=True,
+            column_config=table_config(detail_cols),
+        )
 
 
 def options_from_data(df: pd.DataFrame, column: str, defaults: list[str]) -> list[str]:
@@ -1625,7 +1844,7 @@ def main() -> None:
     )
 
     if page == "📊 Dashboard":
-        show_dashboard(df, catalog)
+        show_dashboard(engine, df, catalog)
     elif page == "➕ Lançar resultado":
         show_lancamento(engine, df)
     elif page == "📋 Registros":
