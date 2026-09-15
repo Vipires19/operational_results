@@ -1,42 +1,5 @@
-from database.connection import get_engine, init_schema
-from database.repository import (
-    attach_extra_columns,
-    create_indicator,
-    delete_indicator,
-    delete_result,
-    get_member_production,
-    insert_many,
-    insert_result,
-    list_active_indicators,
-    list_indicators,
-    load_data,
-    load_extras_wide,
-    load_index_weights,
-    load_occurrences_map,
-    load_seizure_summary_by_result,
-    normalize_member_name,
-    parse_members,
-    set_indicator_active,
-)
+"""Persistência do Resultado Operacional.
 
-__all__ = [
-    "get_engine",
-    "init_schema",
-    "load_data",
-    "load_extras_wide",
-    "attach_extra_columns",
-    "insert_result",
-    "insert_many",
-    "delete_result",
-    "list_indicators",
-    "list_active_indicators",
-    "create_indicator",
-    "set_indicator_active",
-    "delete_indicator",
-    "get_member_production",
-    "load_index_weights",
-    "load_occurrences_map",
-    "load_seizure_summary_by_result",
-    "normalize_member_name",
-    "parse_members",
-]
+Não importar connection/repository neste arquivo: isso cria ciclo de import
+no Python 3.14 (Streamlit Cloud) e quebra `from database.repository import ...`.
+"""

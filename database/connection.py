@@ -26,6 +26,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
 
+from database.scoring import FIXED_INDEX_METRICS
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "resultado_operacional.db"
 
@@ -353,9 +355,36 @@ def init_schema(engine: Engine) -> None:
         )
     _seed_default_indicators(engine)
     _deactivate_reserved_dynamic_indicators(engine)
-    from database.repository import ensure_index_weights
-
     ensure_index_weights(engine)
+
+
+def ensure_index_weights(engine: Engine) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    with engine.begin() as conn:
+        existing = {
+            str(row.metric_key)
+            for row in conn.execute(select(index_weights.c.metric_key))
+        }
+        payloads = []
+        for key, _label, weight in FIXED_INDEX_METRICS:
+            if key in existing:
+                continue
+            payloads.append(
+                {"metric_key": key, "weight": weight, "updated_at": now}
+            )
+            existing.add(key)
+        extra_slugs = [
+            str(row.slug)
+            for row in conn.execute(select(operational_indicators.c.slug))
+            if str(row.slug) not in existing
+        ]
+        for slug in extra_slugs:
+            payloads.append(
+                {"metric_key": slug, "weight": 0, "updated_at": now}
+            )
+            existing.add(slug)
+        if payloads:
+            conn.execute(index_weights.insert(), payloads)
 
 
 def _seed_default_indicators(engine: Engine) -> None:

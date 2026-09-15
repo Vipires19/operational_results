@@ -7,16 +7,19 @@ import streamlit as st
 
 from charts.dashboard import area_daily, horizontal_bar
 from database.connection import backend_label, get_engine
+from database.scoring import (
+    add_production_index,
+    calculate_production_index,
+    parse_weight,
+)
 from database.repository import (
     APOIOS_SLUG,
     KPI_CATEGORY_LABELS,
     PRODUCTIVITY_COLS,
     RESERVED_SLUGS,
     SEIZURE_CATEGORIES,
-    add_production_index,
     assert_unique_columns,
     attach_extra_columns,
-    calculate_production_index,
     count_occurrences_for_result,
     dynamic_catalog,
     create_indicator,
@@ -48,7 +51,6 @@ from database.repository import (
     load_occurrences_map,
     load_seizure_summary_by_result,
     occurrence_type_usage_counts,
-    parse_weight,
     save_index_weights,
     set_indicator_active,
     set_occurrence_type_active,

@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import Connection, Engine
 
 from database.connection import (
+    ensure_index_weights,
     index_weights,
     occurrence_seizures,
     occurrence_types,
@@ -21,6 +22,15 @@ from database.connection import (
     result_members,
     resultados,
 )
+from database.scoring import (
+    APOIOS_SLUG,
+    DEFAULT_INDEX_WEIGHTS,
+    FIXED_INDEX_KEYS,
+    FIXED_INDEX_METRICS,
+    add_production_index,
+    calculate_production_index,
+    parse_weight,
+)
 
 METRIC_COLS = ["abordados", "carros", "motos", "bopm", "ocorrencias"]
 PRODUCTIVITY_COLS = [
@@ -29,24 +39,6 @@ PRODUCTIVITY_COLS = [
     "veiculos_recuperados",
 ]
 RESULT_METRIC_COLS = METRIC_COLS + PRODUCTIVITY_COLS
-
-APOIOS_SLUG = "apoios_operacionais"
-
-FIXED_INDEX_METRICS: list[tuple[str, str, Decimal]] = [
-    ("abordados", "Abordados", Decimal("2")),
-    ("carros", "Carros", Decimal("1")),
-    ("motos", "Motos", Decimal("1")),
-    ("bopm", "BOPM", Decimal("0")),
-    ("ocorrencias", "Ocorrências", Decimal("5")),
-    (APOIOS_SLUG, "Apoios Operacionais", Decimal("0")),
-    ("pessoas_presas", "Pessoas presas", Decimal("0")),
-    ("condenados_capturados", "Condenados capturados", Decimal("0")),
-    ("veiculos_recuperados", "Veículos recuperados", Decimal("0")),
-]
-
-DEFAULT_INDEX_WEIGHTS = {key: weight for key, _label, weight in FIXED_INDEX_METRICS}
-FIXED_INDEX_LABELS = {key: label for key, label, _weight in FIXED_INDEX_METRICS}
-FIXED_INDEX_KEYS = [key for key, _label, _weight in FIXED_INDEX_METRICS]
 
 RESERVED_SLUGS = {
     *RESULT_METRIC_COLS,
@@ -180,112 +172,6 @@ def format_members(names: list[str]) -> str:
 
 def normalize_item(value: str) -> str:
     return " ".join((value or "").split()).upper()
-
-
-def parse_weight(value) -> Decimal:
-    if value is None:
-        raise ValueError("Informe um peso numérico maior ou igual a zero.")
-    if isinstance(value, bool):
-        raise ValueError("Peso inválido.")
-    if isinstance(value, float) and (
-        value != value or value in (float("inf"), float("-inf"))
-    ):
-        raise ValueError("Peso inválido.")
-    text = str(value).strip().replace(" ", "").replace(",", ".")
-    try:
-        number = Decimal(text)
-    except (InvalidOperation, ValueError) as exc:
-        raise ValueError("Peso inválido.") from exc
-    if not number.is_finite():
-        raise ValueError("Peso inválido.")
-    if number < 0:
-        raise ValueError("O peso não pode ser negativo.")
-    return number.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-
-
-def calculate_production_index(
-    metrics,
-    weights: dict[str, Decimal] | None = None,
-) -> Decimal:
-    """Σ (valor da métrica × peso atual). Fonte única do Índice de Produção."""
-    resolved = weights if weights is not None else DEFAULT_INDEX_WEIGHTS
-    getter = metrics.get if hasattr(metrics, "get") else None
-    total = Decimal("0")
-    for key, raw_weight in resolved.items():
-        weight = (
-            raw_weight
-            if isinstance(raw_weight, Decimal)
-            else parse_weight(raw_weight)
-        )
-        if weight == 0:
-            continue
-        if getter is not None:
-            raw_value = getter(key, 0)
-        else:
-            raw_value = metrics[key] if key in metrics else 0
-        try:
-            value = Decimal(str(int(raw_value or 0)))
-        except (TypeError, ValueError):
-            value = Decimal("0")
-        total += value * weight
-    return total
-
-
-def add_production_index(
-    df: pd.DataFrame,
-    weights: dict[str, Decimal] | None = None,
-) -> pd.DataFrame:
-    out = df.copy()
-    resolved = weights if weights is not None else DEFAULT_INDEX_WEIGHTS
-    if out.empty:
-        out["indice_producao"] = pd.Series(dtype="float64")
-        return out
-    score = pd.Series(0.0, index=out.index, dtype="float64")
-    for key, raw_weight in resolved.items():
-        weight = float(
-            raw_weight
-            if isinstance(raw_weight, Decimal)
-            else parse_weight(raw_weight)
-        )
-        if weight == 0 or key not in out.columns:
-            continue
-        values = pd.to_numeric(out[key], errors="coerce").fillna(0)
-        score = score + values.astype(float) * weight
-    out["indice_producao"] = score
-    return out
-
-
-def ensure_index_weights(engine: Engine) -> None:
-    now = _now()
-    with engine.begin() as conn:
-        existing = {
-            str(row.metric_key)
-            for row in conn.execute(select(index_weights.c.metric_key))
-        }
-        payloads = []
-        for key, _label, weight in FIXED_INDEX_METRICS:
-            if key in existing:
-                continue
-            payloads.append(
-                {"metric_key": key, "weight": weight, "updated_at": now}
-            )
-            existing.add(key)
-        extra_slugs = [
-            str(row.slug)
-            for row in conn.execute(select(operational_indicators.c.slug))
-            if str(row.slug) not in existing
-        ]
-        for slug in extra_slugs:
-            payloads.append(
-                {
-                    "metric_key": slug,
-                    "weight": Decimal("0"),
-                    "updated_at": now,
-                }
-            )
-            existing.add(slug)
-        if payloads:
-            conn.execute(index_weights.insert(), payloads)
 
 
 def load_index_weights(engine: Engine) -> dict[str, Decimal]:
