@@ -1,5 +1,6 @@
 import logging
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 import pandas as pd
 import streamlit as st
@@ -12,8 +13,10 @@ from database.repository import (
     PRODUCTIVITY_COLS,
     RESERVED_SLUGS,
     SEIZURE_CATEGORIES,
+    add_production_index,
     assert_unique_columns,
     attach_extra_columns,
+    calculate_production_index,
     count_occurrences_for_result,
     dynamic_catalog,
     create_indicator,
@@ -33,16 +36,20 @@ from database.repository import (
     insert_result,
     list_active_indicators,
     list_indicators,
+    list_index_weight_items,
     list_linked_occurrences,
     list_occurrence_types,
     list_results_by_date,
     load_data,
     load_extras_wide,
+    load_index_weights,
     load_members_map,
     load_occurrences,
     load_occurrences_map,
     load_seizure_summary_by_result,
     occurrence_type_usage_counts,
+    parse_weight,
+    save_index_weights,
     set_indicator_active,
     set_occurrence_type_active,
     update_occurrence,
@@ -139,6 +146,15 @@ def fmt_int(value) -> str:
     return f"{int(value):,}".replace(",", ".")
 
 
+def fmt_index(value) -> str:
+    quantized = Decimal(str(value or 0)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    if quantized == quantized.to_integral():
+        return fmt_int(int(quantized))
+    return f"{quantized:.2f}".replace(".", ",")
+
+
 def fmt_date_long(value) -> str:
     day = value.date() if hasattr(value, "date") else value
     meses = (
@@ -172,34 +188,8 @@ def metric_lines(pairs: list[tuple[str, str]]) -> str:
     return "  \n".join(f"{label}: **{value}**" for label, value in pairs)
 
 
-def production_score(df: pd.DataFrame) -> pd.Series:
-    """
-    Índice simples de produção para ranking.
-
-    Pesos atuais:
-    - Abordados: x2
-    - Carros: x1
-    - Motos: x1
-    - Ocorrências: x5
-
-    O BOPM permanece como indicador individual,
-    mas não entra no índice atualmente.
-    """
-    return (
-        df["abordados"] * 2
-        + df["carros"] * 1
-        + df["motos"] * 1
-        + df["ocorrencias"] * 5
-    )
-
-
-def add_score(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        out["indice_producao"] = pd.Series(dtype="int64")
-        return out
-    out["indice_producao"] = production_score(out)
-    return out
+def add_score(df: pd.DataFrame, weights=None) -> pd.DataFrame:
+    return add_production_index(df, weights)
 
 
 def filtered_data(df, start, end, modalidades, pelotoes, equipes):
@@ -268,7 +258,9 @@ def table_config(columns: list[str], catalog: list[dict] | None = None) -> dict:
         if col in extra:
             name = next((i["name"] for i in (catalog or []) if i["slug"] == col), col)
             config[col] = number_column(name)
-        elif col in METRIC_COLS or col in PRODUCTIVITY_COLS or col == "indice_producao":
+        elif col == "indice_producao":
+            config[col] = st.column_config.NumberColumn(label)
+        elif col in METRIC_COLS or col in PRODUCTIVITY_COLS:
             config[col] = number_column(label)
         elif col == "id":
             config[col] = number_column(label)
@@ -283,12 +275,13 @@ def obs_flag(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().map(lambda text: "📝" if text else "")
 
 
-def show_kpi_row(f: pd.DataFrame) -> None:
+def show_kpi_row(f: pd.DataFrame, weights) -> None:
     totals = {col: int(f[col].sum()) if not f.empty else 0 for col in METRIC_COLS}
-    indice = int(production_score(f).sum()) if not f.empty else 0
+    scored = add_score(f, weights)
+    indice = float(scored["indice_producao"].sum()) if not scored.empty else 0
     n_equipes = int(f["equipe"].nunique()) if not f.empty else 0
     n_dias = int(f["data"].dt.date.nunique()) if not f.empty else 0
-    media_diaria = int(round(indice / n_dias)) if n_dias else 0
+    media_diaria = round(indice / n_dias, 2) if n_dias else 0
 
     cols = st.columns(6)
     cols[0].metric("Abordados", fmt_int(totals["abordados"]))
@@ -296,22 +289,22 @@ def show_kpi_row(f: pd.DataFrame) -> None:
     cols[2].metric("Motos", fmt_int(totals["motos"]))
     cols[3].metric("BOPM", fmt_int(totals["bopm"]))
     cols[4].metric("Ocorrências", fmt_int(totals["ocorrencias"]))
-    cols[5].metric("Índice de produção", fmt_int(indice))
+    cols[5].metric("Índice de produção", fmt_index(indice))
 
     st.caption(
         f"{n_equipes} equipe(s) · {n_dias} dia(s) no período · "
-        f"média diária do índice: **{fmt_int(media_diaria)}**"
+        f"média diária do índice: **{fmt_index(media_diaria)}**"
     )
 
 
-def aggregate(df: pd.DataFrame, by: str, slugs: list[str]) -> pd.DataFrame:
+def aggregate(df: pd.DataFrame, by: str, slugs: list[str], weights=None) -> pd.DataFrame:
     assert_unique_columns(df, "aggregate:entrada")
     cols = unique_keep_order(
         [c for c in [*METRIC_COLS, *PRODUCTIVITY_COLS, *slugs] if c in df.columns]
     )
     grouped = df.groupby(by, as_index=False)[cols].sum()
     assert_unique_columns(grouped, "aggregate:saida")
-    return add_score(grouped)
+    return add_score(grouped, weights)
 
 
 def ensure_metric_column(df: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -405,7 +398,8 @@ def show_dashboard(engine, df: pd.DataFrame, catalog: list[dict]) -> None:
         return
 
     f = filtered_data(df, start, end, modalidades, pelotoes, equipes)
-    show_kpi_row(f)
+    weights = load_index_weights(engine)
+    show_kpi_row(f, weights)
 
     if f.empty:
         st.warning("Nenhum resultado encontrado para os filtros selecionados.")
@@ -417,13 +411,13 @@ def show_dashboard(engine, df: pd.DataFrame, catalog: list[dict]) -> None:
     extra_keys = chart_keys(catalog, include_index=False)
     members_map = load_members_map(engine)
 
-    show_individual_and_daily(f, members_map, slugs, labels, ranking_keys)
-    show_pelotao_and_modalidade(f, slugs, labels, ranking_keys, extra_keys)
-    show_latest_results(f, members_map, engine)
-    show_detailed_analyses(f, slugs)
+    show_individual_and_daily(f, members_map, slugs, labels, ranking_keys, weights)
+    show_pelotao_and_modalidade(f, slugs, labels, ranking_keys, extra_keys, weights)
+    show_latest_results(f, members_map, engine, weights)
+    show_detailed_analyses(f, slugs, weights)
 
 
-def show_latest_results(f: pd.DataFrame, members_map: dict, engine) -> None:
+def show_latest_results(f: pd.DataFrame, members_map: dict, engine, weights) -> None:
     latest_ts = f["data"].max()
     latest = f[f["data"] == latest_ts].sort_values(["equipe", "id"])
     records = latest.to_dict("records")
@@ -445,6 +439,7 @@ def show_latest_results(f: pd.DataFrame, members_map: dict, engine) -> None:
                     members_map.get(int(record["id"]), []),
                     occ_map.get(int(record["id"]), []),
                     seizure_map.get(int(record["id"]), {}),
+                    weights,
                 )
 
 
@@ -453,20 +448,16 @@ def render_latest_result_card(
     members: list[str],
     occurrences: list[dict],
     seizures: dict,
+    weights,
 ) -> None:
-    score = int(
-        record["abordados"] * 2
-        + record["carros"]
-        + record["motos"]
-        + record["ocorrencias"] * 5
-    )
+    score = calculate_production_index(record, weights)
     apoios = int(record.get(APOIOS_SLUG, 0) or 0)
     bopm = int(record.get("bopm", 0) or 0)
 
     with st.container(border=True):
         st.markdown(f"**{record['equipe']}**")
         st.caption(f"{record['pelotao']} • {record['modalidade']}")
-        st.caption(f"Índice: {fmt_int(score)}")
+        st.caption(f"Índice: {fmt_index(score)}")
 
         if members:
             st.markdown("  \n".join(str(name) for name in members))
@@ -535,6 +526,7 @@ def show_individual_and_daily(
     slugs: list[str],
     labels: dict[str, str],
     ranking_keys: list[str],
+    weights,
 ) -> None:
     left, right = st.columns([1.15, 1])
     with left:
@@ -554,7 +546,7 @@ def show_individual_and_daily(
             key="ranking_top",
             label_visibility="collapsed",
         )
-        production = get_member_production(f, members_map, slugs)
+        production = get_member_production(f, members_map, slugs, weights=weights)
         if production.empty:
             st.info(
                 "Ainda não há efetivo estruturado suficiente "
@@ -582,12 +574,15 @@ def show_individual_and_daily(
 
     with right:
         st.subheader("📈 Evolução diária")
+        daily_cols = unique_keep_order(
+            [c for c in [*METRIC_COLS, *PRODUCTIVITY_COLS, *slugs] if c in f.columns]
+        )
         daily = (
-            f.groupby("data", as_index=False)[METRIC_COLS]
+            f.groupby("data", as_index=False)[daily_cols]
             .sum()
             .sort_values("data")
         )
-        daily = add_score(daily)
+        daily = add_score(daily, weights)
         show_ma = len(daily) >= 7
         if show_ma:
             daily["mm7"] = daily["indice_producao"].rolling(7, min_periods=7).mean()
@@ -602,6 +597,7 @@ def show_pelotao_and_modalidade(
     labels: dict[str, str],
     ranking_keys: list[str],
     extra_keys: list[str],
+    weights,
 ) -> None:
     left, right = st.columns([1.15, 1])
     with left:
@@ -614,7 +610,7 @@ def show_pelotao_and_modalidade(
             key="pelotao_metric",
             label_visibility="collapsed",
         )
-        by_pelotao = ensure_metric_column(aggregate(f, "pelotao", slugs), pelotao_metric)
+        by_pelotao = ensure_metric_column(aggregate(f, "pelotao", slugs, weights), pelotao_metric)
         plot_chart(
             horizontal_bar(
                 by_pelotao,
@@ -634,7 +630,7 @@ def show_pelotao_and_modalidade(
             key="modalidade_metric",
             label_visibility="collapsed",
         )
-        by_mod = ensure_metric_column(aggregate(f, "modalidade", slugs), modalidade_metric)
+        by_mod = ensure_metric_column(aggregate(f, "modalidade", slugs, weights), modalidade_metric)
         plot_chart(
             horizontal_bar(
                 by_mod,
@@ -645,9 +641,9 @@ def show_pelotao_and_modalidade(
         )
 
 
-def show_detailed_analyses(f: pd.DataFrame, slugs: list[str]) -> None:
+def show_detailed_analyses(f: pd.DataFrame, slugs: list[str], weights) -> None:
     with st.expander("📋 Análises detalhadas", expanded=False):
-        by_equipe = aggregate(f, "equipe", slugs)
+        by_equipe = aggregate(f, "equipe", slugs, weights)
         ranking_display = by_equipe.sort_values(
             "indice_producao", ascending=False
         ).copy()
@@ -673,12 +669,15 @@ def show_detailed_analyses(f: pd.DataFrame, slugs: list[str]) -> None:
             },
         )
 
+        source_cols = unique_keep_order(
+            [c for c in [*METRIC_COLS, *PRODUCTIVITY_COLS, *slugs] if c in f.columns]
+        )
         daily = (
-            f.groupby("data", as_index=False)[METRIC_COLS]
+            f.groupby("data", as_index=False)[source_cols]
             .sum()
             .sort_values("data", ascending=False)
         )
-        daily = add_score(daily)
+        daily = add_score(daily, weights)
         daily_display = daily.copy()
         daily_display["data"] = daily_display["data"].dt.strftime("%d/%m/%Y")
         daily_cols = ["data", *METRIC_COLS, "indice_producao"]
@@ -690,7 +689,7 @@ def show_detailed_analyses(f: pd.DataFrame, slugs: list[str]) -> None:
             column_config=table_config(daily_cols),
         )
 
-        detail = add_score(f).sort_values(["data", "id"], ascending=[False, False])
+        detail = add_score(f, weights).sort_values(["data", "id"], ascending=[False, False])
         detail_view = detail.copy()
         detail_view["data"] = detail_view["data"].dt.strftime("%d/%m/%Y")
         detail_view["obs"] = obs_flag(detail_view.get("observacao", pd.Series(dtype=str)))
@@ -932,7 +931,7 @@ def show_lancamento(engine, df: pd.DataFrame) -> None:
 
 
 @st.dialog("Detalhes do Resultado Operacional", width="large")
-def show_result_details(engine, record: pd.Series, extras: list[dict]) -> None:
+def show_result_details(engine, record: pd.Series, extras: list[dict], weights) -> None:
     result_id = int(record["id"])
     st.caption(f"ID {result_id}")
 
@@ -963,13 +962,11 @@ def show_result_details(engine, record: pd.Series, extras: list[dict]) -> None:
     prod[0].metric("Pessoas presas", fmt_int(record.get("pessoas_presas", 0)))
     prod[1].metric("Condenados capturados", fmt_int(record.get("condenados_capturados", 0)))
     prod[2].metric("Veículos recuperados", fmt_int(record.get("veiculos_recuperados", 0)))
-    score = int(
-        record["abordados"] * 2
-        + record["carros"]
-        + record["motos"]
-        + record["ocorrencias"] * 5
-    )
-    prod[3].metric("Índice", fmt_int(score))
+    metrics_map = record.to_dict()
+    for item in extras:
+        metrics_map[item["slug"]] = int(item["value"] or 0)
+    score = calculate_production_index(metrics_map, weights)
+    prod[3].metric("Índice", fmt_index(score))
 
     extras_shown = [
         item
@@ -1063,7 +1060,12 @@ def show_registros(engine, df: pd.DataFrame) -> None:
     with actions[0]:
         if st.button("Ver detalhes", disabled=selected_record is None, type="primary"):
             extras = get_result_extra_values(engine, int(selected_record["id"]))
-            show_result_details(engine, selected_record, extras)
+            show_result_details(
+                engine,
+                selected_record,
+                extras,
+                load_index_weights(engine),
+            )
     with actions[1]:
         if st.button("Editar resultado", disabled=selected_record is None):
             st.session_state.edit_result_id = int(selected_record["id"])
@@ -1130,9 +1132,58 @@ def show_registros(engine, df: pd.DataFrame) -> None:
 def show_indicadores(engine) -> None:
     st.title("⚙️ Indicadores")
     st.caption(
-        "Cadastre métricas complementares sem alterar os indicadores fixos "
-        "nem o índice de produção."
+        "Cadastre métricas complementares e configure os pesos do Índice de Produção."
     )
+
+    st.subheader("⚖️ Pesos do Índice de Produção")
+    st.caption(
+        "O peso define quanto cada unidade do indicador acrescenta ao Índice "
+        "de Produção. Peso 0 significa que o indicador não participa da pontuação. "
+        "Exemplo: Abordados = 2 e 10 abordados resultam em 20 pontos."
+    )
+    weight_items = list_index_weight_items(engine)
+    with st.form("salvar_pesos_indice"):
+        new_weights = {}
+        fixed_items = [item for item in weight_items if item["group"] == "fixed"]
+        extra_items = [item for item in weight_items if item["group"] == "dynamic"]
+        for item in fixed_items:
+            new_weights[item["metric_key"]] = st.number_input(
+                item["label"],
+                min_value=0.0,
+                step=0.5,
+                value=float(item["weight"]),
+                format="%.4f",
+                key=f"weight_{item['metric_key']}",
+            )
+        if extra_items:
+            st.markdown("**Indicadores adicionais**")
+            for item in extra_items:
+                new_weights[item["metric_key"]] = st.number_input(
+                    item["label"],
+                    min_value=0.0,
+                    step=0.5,
+                    value=float(item["weight"]),
+                    format="%.4f",
+                    key=f"weight_{item['metric_key']}",
+                )
+        saved_weights = st.form_submit_button("Salvar pesos", type="primary")
+    if saved_weights:
+        try:
+            parsed = {
+                key: parse_weight(value) for key, value in new_weights.items()
+            }
+            save_index_weights(engine, parsed)
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception:
+            logger.exception("Falha ao salvar pesos do índice.")
+            st.error("Não foi possível salvar os pesos. Tente novamente.")
+        else:
+            st.success("Pesos do Índice de Produção atualizados.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Indicadores adicionais")
 
     with st.form("novo_indicador"):
         name = st.text_input("Nome do indicador", placeholder="Ex.: Veículos Recuperados")
@@ -1172,36 +1223,37 @@ def show_indicadores(engine) -> None:
     st.subheader("Ativar / desativar")
     if not dynamic_items:
         st.caption("Não há indicadores dinâmicos para ativar ou desativar.")
-        return
-    options = {
-        f"{item['name']} ({'ativo' if item['active'] else 'inativo'})": item
-        for item in dynamic_items
-    }
-    chosen_label = st.selectbox("Indicador", list(options.keys()))
-    chosen = options[chosen_label]
-    c1, c2, c3 = st.columns(3)
-    if c1.button("Ativar"):
-        try:
-            set_indicator_active(engine, chosen["id"], True)
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
+    else:
+        options = {
+            f"{item['name']} ({'ativo' if item['active'] else 'inativo'})": item
+            for item in dynamic_items
+        }
+        chosen_label = st.selectbox("Indicador", list(options.keys()))
+        chosen = options[chosen_label]
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Ativar"):
+            try:
+                set_indicator_active(engine, chosen["id"], True)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
+        if c2.button("Desativar"):
+            set_indicator_active(engine, chosen["id"], False)
             st.rerun()
-    if c2.button("Desativar"):
-        set_indicator_active(engine, chosen["id"], False)
-        st.rerun()
-    if c3.button("Excluir se sem histórico"):
-        try:
-            delete_indicator(engine, chosen["id"])
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
-            st.success("Indicador excluído.")
-            st.rerun()
+        if c3.button("Excluir se sem histórico"):
+            try:
+                delete_indicator(engine, chosen["id"])
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.success("Indicador excluído.")
+                st.rerun()
 
     st.caption(
         "Indicadores inativos saem do lançamento, mas permanecem no histórico, "
-        "nos gráficos e na exportação. Campos fixos de resultados "
+        "nos gráficos, na exportação e no Índice se o peso for maior que zero. "
+        "Campos fixos de resultados "
         "(pessoas presas, condenados capturados e veículos recuperados) "
         "não podem ser cadastrados ou reativados como indicadores dinâmicos."
     )
@@ -1759,6 +1811,7 @@ def show_exportacao(df: pd.DataFrame, catalog: list[dict], engine) -> None:
         return
 
     export = df.copy()
+    export = add_score(export, load_index_weights(engine))
     export["data"] = export["data"].dt.strftime("%d/%m/%Y")
     members_map = load_members_map(engine)
     export["efetivo"] = export["id"].map(
@@ -1777,6 +1830,7 @@ def show_exportacao(df: pd.DataFrame, catalog: list[dict], engine) -> None:
             *METRIC_COLS,
             *PRODUCTIVITY_COLS,
             *extra_cols,
+            "indice_producao",
             "observacao",
         ]
     )
@@ -1795,6 +1849,7 @@ def show_exportacao(df: pd.DataFrame, catalog: list[dict], engine) -> None:
         "pessoas_presas": "PESSOAS PRESAS",
         "condenados_capturados": "CONDENADOS CAPTURADOS",
         "veiculos_recuperados": "VEICULOS RECUPERADOS",
+        "indice_producao": "INDICE PRODUCAO",
         "observacao": "OBSERVACAO",
     }
     for item in catalog:

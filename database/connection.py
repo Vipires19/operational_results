@@ -105,6 +105,15 @@ result_indicator_values = Table(
     Index("ix_result_indicator_values_indicator_id", "indicator_id"),
 )
 
+index_weights = Table(
+    "index_weights",
+    metadata,
+    Column("metric_key", Text, primary_key=True),
+    Column("weight", Numeric(12, 4), nullable=False, server_default="0"),
+    Column("updated_at", Text, nullable=False),
+    CheckConstraint("weight >= 0", name="ck_index_weights_weight"),
+)
+
 result_members = Table(
     "result_members",
     metadata,
@@ -344,6 +353,9 @@ def init_schema(engine: Engine) -> None:
         )
     _seed_default_indicators(engine)
     _deactivate_reserved_dynamic_indicators(engine)
+    from database.repository import ensure_index_weights
+
+    ensure_index_weights(engine)
 
 
 def _seed_default_indicators(engine: Engine) -> None:

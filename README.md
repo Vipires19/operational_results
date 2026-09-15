@@ -11,15 +11,15 @@ Aplicação Streamlit para registrar e analisar o resultado operacional por data
 - Ocorrências
 - Índice de produção
 
-O índice de produção usado no ranking é:
+O índice de produção é calculado com pesos configuráveis na página **Indicadores**.
+
+A configuração inicial (equivalente à fórmula histórica) é:
 
 ```text
-abordados * 2 + carros + motos + ocorrencias * 5
+abordados * 2 + carros * 1 + motos * 1 + ocorrencias * 5
 ```
 
-O BOPM permanece visível como indicador individual e **não entra** no índice.
-
-Indicadores adicionais, efetivo, apreensões e tipos de ocorrência também **não entram** no índice.
+Os demais indicadores começam com peso 0. Alterar um peso recalcula o índice de todo o período com a régua atual.
 
 ## Efetivo da equipe
 

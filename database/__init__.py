@@ -11,8 +11,11 @@ from database.repository import (
     list_indicators,
     load_data,
     load_extras_wide,
+    load_index_weights,
     load_occurrences_map,
     load_seizure_summary_by_result,
+    normalize_member_name,
+    parse_members,
     set_indicator_active,
 )
 
@@ -31,6 +34,9 @@ __all__ = [
     "set_indicator_active",
     "delete_indicator",
     "get_member_production",
+    "load_index_weights",
     "load_occurrences_map",
     "load_seizure_summary_by_result",
+    "normalize_member_name",
+    "parse_members",
 ]

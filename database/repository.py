@@ -8,10 +8,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import pandas as pd
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import Connection, Engine
 
 from database.connection import (
+    index_weights,
     occurrence_seizures,
     occurrence_types,
     occurrences,
@@ -30,6 +31,22 @@ PRODUCTIVITY_COLS = [
 RESULT_METRIC_COLS = METRIC_COLS + PRODUCTIVITY_COLS
 
 APOIOS_SLUG = "apoios_operacionais"
+
+FIXED_INDEX_METRICS: list[tuple[str, str, Decimal]] = [
+    ("abordados", "Abordados", Decimal("2")),
+    ("carros", "Carros", Decimal("1")),
+    ("motos", "Motos", Decimal("1")),
+    ("bopm", "BOPM", Decimal("0")),
+    ("ocorrencias", "Ocorrências", Decimal("5")),
+    (APOIOS_SLUG, "Apoios Operacionais", Decimal("0")),
+    ("pessoas_presas", "Pessoas presas", Decimal("0")),
+    ("condenados_capturados", "Condenados capturados", Decimal("0")),
+    ("veiculos_recuperados", "Veículos recuperados", Decimal("0")),
+]
+
+DEFAULT_INDEX_WEIGHTS = {key: weight for key, _label, weight in FIXED_INDEX_METRICS}
+FIXED_INDEX_LABELS = {key: label for key, label, _weight in FIXED_INDEX_METRICS}
+FIXED_INDEX_KEYS = [key for key, _label, _weight in FIXED_INDEX_METRICS]
 
 RESERVED_SLUGS = {
     *RESULT_METRIC_COLS,
@@ -119,26 +136,225 @@ def slugify(name: str) -> str:
     return ascii_text or "indicador"
 
 
-def parse_members(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    names = []
-    seen = set()
-    for part in str(raw).replace("\n", "/").split("/"):
-        name = " ".join(part.split()).upper()
+def normalize_member_name(value: str | None) -> str:
+    """Identidade textual do policial: trim, uppercase e espaços colapsados."""
+    if value is None:
+        return ""
+    return " ".join(str(value).split()).upper()
+
+
+def _dedupe_member_names(names: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = normalize_member_name(raw)
         if not name or name in seen:
             continue
         seen.add(name)
-        names.append(name)
-    return names
+        ordered.append(name)
+    return ordered
+
+
+def parse_members(raw: str | None) -> list[str]:
+    """Converte o texto do formulário em efetivo normalizado, sem duplicatas."""
+    if not raw:
+        return []
+    text = str(raw).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "/")
+    return _dedupe_member_names(text.split("/"))
+
+
+def coerce_members(value) -> list[str]:
+    """Aceita texto (`/`) ou lista e aplica a mesma regra de identidade."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return parse_members(value)
+    if isinstance(value, (list, tuple, pd.Series)):
+        return _dedupe_member_names([str(item) for item in value])
+    return parse_members(str(value))
 
 
 def format_members(names: list[str]) -> str:
-    return " / ".join(names)
+    return " / ".join(_dedupe_member_names(list(names or [])))
 
 
 def normalize_item(value: str) -> str:
     return " ".join((value or "").split()).upper()
+
+
+def parse_weight(value) -> Decimal:
+    if value is None:
+        raise ValueError("Informe um peso numérico maior ou igual a zero.")
+    if isinstance(value, bool):
+        raise ValueError("Peso inválido.")
+    if isinstance(value, float) and (
+        value != value or value in (float("inf"), float("-inf"))
+    ):
+        raise ValueError("Peso inválido.")
+    text = str(value).strip().replace(" ", "").replace(",", ".")
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("Peso inválido.") from exc
+    if not number.is_finite():
+        raise ValueError("Peso inválido.")
+    if number < 0:
+        raise ValueError("O peso não pode ser negativo.")
+    return number.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+
+def calculate_production_index(
+    metrics,
+    weights: dict[str, Decimal] | None = None,
+) -> Decimal:
+    """Σ (valor da métrica × peso atual). Fonte única do Índice de Produção."""
+    resolved = weights if weights is not None else DEFAULT_INDEX_WEIGHTS
+    getter = metrics.get if hasattr(metrics, "get") else None
+    total = Decimal("0")
+    for key, raw_weight in resolved.items():
+        weight = (
+            raw_weight
+            if isinstance(raw_weight, Decimal)
+            else parse_weight(raw_weight)
+        )
+        if weight == 0:
+            continue
+        if getter is not None:
+            raw_value = getter(key, 0)
+        else:
+            raw_value = metrics[key] if key in metrics else 0
+        try:
+            value = Decimal(str(int(raw_value or 0)))
+        except (TypeError, ValueError):
+            value = Decimal("0")
+        total += value * weight
+    return total
+
+
+def add_production_index(
+    df: pd.DataFrame,
+    weights: dict[str, Decimal] | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+    resolved = weights if weights is not None else DEFAULT_INDEX_WEIGHTS
+    if out.empty:
+        out["indice_producao"] = pd.Series(dtype="float64")
+        return out
+    score = pd.Series(0.0, index=out.index, dtype="float64")
+    for key, raw_weight in resolved.items():
+        weight = float(
+            raw_weight
+            if isinstance(raw_weight, Decimal)
+            else parse_weight(raw_weight)
+        )
+        if weight == 0 or key not in out.columns:
+            continue
+        values = pd.to_numeric(out[key], errors="coerce").fillna(0)
+        score = score + values.astype(float) * weight
+    out["indice_producao"] = score
+    return out
+
+
+def ensure_index_weights(engine: Engine) -> None:
+    now = _now()
+    with engine.begin() as conn:
+        existing = {
+            str(row.metric_key)
+            for row in conn.execute(select(index_weights.c.metric_key))
+        }
+        payloads = []
+        for key, _label, weight in FIXED_INDEX_METRICS:
+            if key in existing:
+                continue
+            payloads.append(
+                {"metric_key": key, "weight": weight, "updated_at": now}
+            )
+            existing.add(key)
+        extra_slugs = [
+            str(row.slug)
+            for row in conn.execute(select(operational_indicators.c.slug))
+            if str(row.slug) not in existing
+        ]
+        for slug in extra_slugs:
+            payloads.append(
+                {
+                    "metric_key": slug,
+                    "weight": Decimal("0"),
+                    "updated_at": now,
+                }
+            )
+            existing.add(slug)
+        if payloads:
+            conn.execute(index_weights.insert(), payloads)
+
+
+def load_index_weights(engine: Engine) -> dict[str, Decimal]:
+    ensure_index_weights(engine)
+    weights = dict(DEFAULT_INDEX_WEIGHTS)
+    with engine.connect() as conn:
+        for row in conn.execute(select(index_weights)):
+            weights[str(row.metric_key)] = parse_weight(row.weight)
+    return weights
+
+
+def list_index_weight_items(engine: Engine) -> list[dict]:
+    weights = load_index_weights(engine)
+    catalog = [
+        item for item in list_indicators(engine) if is_dynamic_slug(item["slug"])
+    ]
+    items = []
+    seen = set()
+    for key, label, _default in FIXED_INDEX_METRICS:
+        items.append(
+            {
+                "metric_key": key,
+                "label": label,
+                "weight": weights.get(key, Decimal("0")),
+                "group": "fixed",
+            }
+        )
+        seen.add(key)
+    for item in catalog:
+        slug = item["slug"]
+        if slug in seen:
+            continue
+        items.append(
+            {
+                "metric_key": slug,
+                "label": item["name"],
+                "weight": weights.get(slug, Decimal("0")),
+                "group": "dynamic",
+            }
+        )
+        seen.add(slug)
+    return items
+
+
+def save_index_weights(engine: Engine, payload: dict[str, object]) -> None:
+    parsed = {str(key): parse_weight(value) for key, value in payload.items()}
+    if not parsed:
+        return
+    now = _now()
+    with engine.begin() as conn:
+        existing = {
+            str(row.metric_key)
+            for row in conn.execute(select(index_weights.c.metric_key))
+        }
+        for key, weight in parsed.items():
+            if key in existing:
+                conn.execute(
+                    update(index_weights)
+                    .where(index_weights.c.metric_key == key)
+                    .values(weight=weight, updated_at=now)
+                )
+            else:
+                conn.execute(
+                    index_weights.insert().values(
+                        metric_key=key,
+                        weight=weight,
+                        updated_at=now,
+                    )
+                )
 
 
 def _to_decimal(value) -> Decimal:
@@ -255,6 +471,19 @@ def create_indicator(engine: Engine, name: str) -> dict:
             .returning(operational_indicators.c.id)
         )
         indicator_id = int(result.scalar_one())
+        exists_weight = conn.execute(
+            select(index_weights.c.metric_key).where(
+                index_weights.c.metric_key == slug
+            )
+        ).first()
+        if not exists_weight:
+            conn.execute(
+                index_weights.insert().values(
+                    metric_key=slug,
+                    weight=Decimal("0"),
+                    updated_at=_now(),
+                )
+            )
 
     created = [i for i in list_indicators(engine) if i["id"] == indicator_id]
     return created[0]
@@ -297,11 +526,21 @@ def delete_indicator(engine: Engine, indicator_id: int) -> None:
             "Este indicador já possui histórico. Desative-o em vez de excluir."
         )
     with engine.begin() as conn:
+        row = conn.execute(
+            select(operational_indicators.c.slug).where(
+                operational_indicators.c.id == int(indicator_id)
+            )
+        ).first()
         conn.execute(
             delete(operational_indicators).where(
                 operational_indicators.c.id == int(indicator_id)
             )
         )
+        slug = str(row.slug) if row else ""
+        if slug and slug not in FIXED_INDEX_KEYS:
+            conn.execute(
+                delete(index_weights).where(index_weights.c.metric_key == slug)
+            )
 
 
 def load_data(engine: Engine) -> pd.DataFrame:
@@ -447,12 +686,24 @@ def load_members_map(engine: Engine) -> dict[int, list[str]]:
     mapping: dict[int, list[str]] = {}
     with engine.connect() as conn:
         for row in conn.execute(query):
-            mapping.setdefault(int(row.result_id), []).append(row.member_name)
+            name = normalize_member_name(row.member_name)
+            if not name:
+                continue
+            bucket = mapping.setdefault(int(row.result_id), [])
+            if name not in bucket:
+                bucket.append(name)
     return mapping
 
 
 def get_result_members(engine: Engine, result_id: int) -> list[str]:
-    return load_members_map(engine).get(int(result_id), [])
+    query = (
+        select(result_members.c.member_name)
+        .where(result_members.c.result_id == int(result_id))
+        .order_by(result_members.c.id)
+    )
+    with engine.connect() as conn:
+        names = [row.member_name for row in conn.execute(query)]
+    return _dedupe_member_names(names)
 
 
 def count_occurrences_by_result(engine: Engine) -> dict[int, int]:
@@ -505,7 +756,8 @@ def _save_extra_values(
 
 
 def _save_members(conn: Connection, result_id: int, names: list[str]) -> None:
-    if not names:
+    unique_names = coerce_members(names)
+    if not unique_names:
         return
     now = _now()
     conn.execute(
@@ -516,7 +768,7 @@ def _save_members(conn: Connection, result_id: int, names: list[str]) -> None:
                 "member_name": name,
                 "created_at": now,
             }
-            for name in names
+            for name in unique_names
         ],
     )
 
@@ -545,6 +797,9 @@ def _split_result_payload(row: dict) -> tuple[dict, dict, list[str]]:
     members = payload.pop("members", None)
     if members is None:
         members = parse_members(payload.pop("efetivo", ""))
+    else:
+        payload.pop("efetivo", None)
+        members = coerce_members(members)
     _validate_metrics(payload)
     return payload, extras, members
 
@@ -929,12 +1184,30 @@ def list_linked_occurrences(engine: Engine, result_id: int) -> list[dict]:
     ]
 
 
+def _members_frame(members_map: dict[int, list[str]]) -> pd.DataFrame:
+    rows = []
+    seen: set[tuple[int, str]] = set()
+    for result_id, names in members_map.items():
+        rid = int(result_id)
+        for name in coerce_members(names):
+            pair = (rid, name)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            rows.append({"id": rid, "member_name": name})
+    if not rows:
+        return pd.DataFrame(columns=["id", "member_name"])
+    return pd.DataFrame(rows)
+
+
 def get_member_production(
     df: pd.DataFrame,
     members_map: dict[int, list[str]],
     extra_slugs: list[str] | None = None,
+    weights: dict[str, Decimal] | None = None,
 ) -> pd.DataFrame:
     """Produção por participação: cada policial herda o resultado em que esteve."""
+    resolved_weights = weights if weights is not None else DEFAULT_INDEX_WEIGHTS
     metric_cols = _unique_keep_order(
         [
             *METRIC_COLS,
@@ -951,6 +1224,9 @@ def get_member_production(
 
     assert_unique_columns(df, "get_member_production:entrada")
     work = df.copy()
+    if "id" not in work.columns:
+        return empty
+
     for col in metric_cols:
         if col == "indice_producao":
             continue
@@ -958,33 +1234,30 @@ def get_member_production(
             work[col] = 0
         work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0).astype(int)
 
-    work["indice_producao"] = (
-        work["abordados"] * 2
-        + work["carros"]
-        + work["motos"]
-        + work["ocorrencias"] * 5
-    )
+    # Granularidade segura: um registro por resultado, antes do merge com o efetivo.
+    work = work.drop_duplicates(subset=["id"], keep="first")
+    work = add_production_index(work, resolved_weights)
 
-    members_rows = [
-        {"id": int(result_id), "member_name": name}
-        for result_id, names in members_map.items()
-        for name in names
-        if name
-    ]
-    if not members_rows:
+    members_df = _members_frame(members_map)
+    if members_df.empty:
         return empty
 
-    merged = work.merge(pd.DataFrame(members_rows), on="id", how="inner")
+    merged = work.merge(members_df, on="id", how="inner")
     if merged.empty:
         return empty
+    merged = merged.drop_duplicates(subset=["id", "member_name"], keep="first")
 
     grouped = merged.groupby("member_name", as_index=False).agg(
-        services=("id", "count"),
+        services=("id", "nunique"),
         **{col: (col, "sum") for col in metric_cols},
     )
     grouped["services"] = grouped["services"].astype(int)
     for col in metric_cols:
-        grouped[col] = pd.to_numeric(grouped[col], errors="coerce").fillna(0).astype(int)
+        series = pd.to_numeric(grouped[col], errors="coerce").fillna(0)
+        if col == "indice_producao":
+            grouped[col] = series.astype(float)
+        else:
+            grouped[col] = series.astype(int)
     assert_unique_columns(grouped, "get_member_production:saida")
     return grouped
 
@@ -995,17 +1268,22 @@ def aggregate_member_production(
     end: str | None = None,
 ) -> pd.DataFrame:
     catalog = list_indicators(engine)
+    weights = load_index_weights(engine)
     df = attach_extra_columns(
         load_data(engine), load_extras_wide(engine), catalog
     )
     if df.empty:
-        return get_member_production(df, {}, extra_slugs=[APOIOS_SLUG])
+        return get_member_production(
+            df, {}, extra_slugs=[APOIOS_SLUG], weights=weights
+        )
     if start:
         df = df[df["data"].dt.strftime("%Y-%m-%d") >= start]
     if end:
         df = df[df["data"].dt.strftime("%Y-%m-%d") <= end]
     slugs = [item["slug"] for item in dynamic_catalog(catalog)]
-    return get_member_production(df, load_members_map(engine), slugs)
+    return get_member_production(
+        df, load_members_map(engine), slugs, weights=weights
+    )
 
 
 def load_occurrences_map(

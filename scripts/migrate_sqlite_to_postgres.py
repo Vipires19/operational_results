@@ -30,6 +30,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from database.connection import (
     DB_PATH,
     create_db_engine,
+    index_weights,
     init_schema,
     operational_indicators,
     read_database_url,
@@ -134,6 +135,10 @@ def main() -> int:
             )
         except Exception:
             src_values = pd.DataFrame()
+        try:
+            src_weights = pd.read_sql("SELECT * FROM index_weights", sqlite_engine)
+        except Exception:
+            src_weights = pd.DataFrame()
     except Exception as exc:
         print(f"Falha ao ler o SQLite: {exc}")
         return 1
@@ -242,6 +247,35 @@ def main() -> int:
                         .values(value_rows)
                         .on_conflict_do_nothing(
                             index_elements=["result_id", "indicator_id"]
+                        )
+                    )
+
+            if not src_weights.empty:
+                weight_rows = []
+                for record in src_weights.to_dict(orient="records"):
+                    key = str(record.get("metric_key") or "").strip()
+                    if not key:
+                        continue
+                    weight_rows.append(
+                        {
+                            "metric_key": key,
+                            "weight": record.get("weight") or 0,
+                            "updated_at": str(
+                                record.get("updated_at")
+                                or pd.Timestamp.now().isoformat(timespec="seconds")
+                            ),
+                        }
+                    )
+                for row in weight_rows:
+                    conn.execute(
+                        pg_insert(index_weights)
+                        .values(row)
+                        .on_conflict_do_update(
+                            index_elements=["metric_key"],
+                            set_={
+                                "weight": row["weight"],
+                                "updated_at": row["updated_at"],
+                            },
                         )
                     )
     except Exception as exc:
