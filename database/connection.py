@@ -300,8 +300,27 @@ def _ensure_resultados_columns(engine: Engine) -> None:
             )
 
 
+def _ensure_index_weights_table(engine: Engine) -> None:
+    """Cria index_weights se faltar. create_all pode não rodar de novo
+    quando o engine fica em cache após o deploy."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS index_weights (
+                    metric_key TEXT PRIMARY KEY,
+                    weight NUMERIC(12, 4) NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    CONSTRAINT ck_index_weights_weight CHECK (weight >= 0)
+                )
+                """
+            )
+        )
+
+
 def init_schema(engine: Engine) -> None:
     metadata.create_all(engine)
+    _ensure_index_weights_table(engine)
     _ensure_resultados_columns(engine)
     with engine.begin() as conn:
         conn.execute(
@@ -359,6 +378,7 @@ def init_schema(engine: Engine) -> None:
 
 
 def ensure_index_weights(engine: Engine) -> None:
+    _ensure_index_weights_table(engine)
     now = datetime.now().isoformat(timespec="seconds")
     with engine.begin() as conn:
         existing = {

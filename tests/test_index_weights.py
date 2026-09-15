@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from sqlalchemy import text
+
 from database.connection import create_db_engine, init_schema
 from database.repository import (
     DEFAULT_INDEX_WEIGHTS,
@@ -123,6 +125,13 @@ class IndexPersistenceTests(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
         Path(self.path).unlink(missing_ok=True)
+
+    def test_creates_table_when_missing(self):
+        with self.engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS index_weights"))
+        weights = load_index_weights(self.engine)
+        self.assertEqual(weights["abordados"], Decimal("2"))
+        self.assertEqual(weights["ocorrencias"], Decimal("5"))
 
     def test_seed_is_idempotent_and_matches_legacy(self):
         first = load_index_weights(self.engine)

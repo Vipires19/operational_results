@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from charts.dashboard import area_daily, horizontal_bar
-from database.connection import backend_label, get_engine
+from database.connection import backend_label, create_db_engine, init_schema
 from database.scoring import (
     add_production_index,
     calculate_production_index,
@@ -141,7 +141,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 @st.cache_resource
 def get_cached_engine():
-    return get_engine()
+    return create_db_engine()
 
 
 def fmt_int(value) -> str:
@@ -1873,6 +1873,7 @@ def show_exportacao(df: pd.DataFrame, catalog: list[dict], engine) -> None:
 def main() -> None:
     try:
         engine = get_cached_engine()
+        init_schema(engine)
         catalog = list_indicators(engine)
         df = attach_extra_columns(load_data(engine), load_extras_wide(engine), catalog)
         assert_unique_columns(df, "dataframe principal")
